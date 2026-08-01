@@ -5,6 +5,8 @@ a test share the same in-memory DB) instead of the real .db file, keeping
 tests fast and fully isolated from development data.
 """
 
+from contextlib import contextmanager
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -25,10 +27,17 @@ def db_session():
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
+
     Base.metadata.create_all(bind=engine)
-    TestingSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+    TestingSessionLocal = sessionmaker(
+        bind=engine,
+        autoflush=False,
+        autocommit=False,
+    )
 
     session: Session = TestingSessionLocal()
+
     try:
         yield session
     finally:
@@ -38,14 +47,26 @@ def db_session():
 
 
 @pytest.fixture()
+def workflow_session_factory(db_session):
+    """Return a session_scope-compatible factory for WorkflowService tests."""
+
+    @contextmanager
+    def _session_factory():
+        yield db_session
+
+    return _session_factory
+
+
+@pytest.fixture()
 def client(db_session):
-    """Yield a TestClient whose get_db dependency is overridden with the
-    isolated in-memory db_session, so API tests never touch the real DB file."""
+    """Yield a TestClient using the isolated in-memory database."""
 
     def _override_get_db():
         yield db_session
 
     app.dependency_overrides[get_db] = _override_get_db
+
     with TestClient(app) as test_client:
         yield test_client
+
     app.dependency_overrides.clear()

@@ -7,6 +7,7 @@ exception handlers and routers, and serves the static frontend.
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from app.api.chat_router import router as chat_router
 
 from app.api.health_router import router as health_router
 from app.api.notes_router import router as notes_router
@@ -41,7 +42,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health_router, prefix="/api/v1")
     app.include_router(notes_router, prefix="/api/v1")
-
+    app.include_router(chat_router, prefix="/api/v1")
     # Serve the static frontend dashboard.
     app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
