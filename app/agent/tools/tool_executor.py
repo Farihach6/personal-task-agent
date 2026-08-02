@@ -5,6 +5,7 @@ Dispatches a tool call to the appropriate tool implementation.
 
 from typing import Any, Protocol
 
+from app.agent.tools.notes_tool import NotesTool
 from app.agent.tools.search_tool import SearchTool
 from app.core.exceptions import GuardrailViolation, ToolExecutionError
 from app.core.logger import get_logger
@@ -25,7 +26,14 @@ class ToolExecutor:
     """Registry + dispatcher for agent tools."""
 
     def __init__(self, tools: list[Tool] | None = None) -> None:
-        registered = tools if tools is not None else [SearchTool()]
+        registered = (
+            tools
+            if tools is not None
+            else [
+                SearchTool(),
+                NotesTool(),
+            ]
+        )
         self._tools: dict[str, Tool] = {
             tool.name: tool for tool in registered
         }

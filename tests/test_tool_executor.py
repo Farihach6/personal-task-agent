@@ -2,6 +2,7 @@
 
 import pytest
 
+from app.agent.tools.notes_tool import NotesTool
 from app.agent.tools.search_tool import SearchTool
 from app.agent.tools.tool_executor import ToolExecutor
 from app.core.exceptions import GuardrailViolation, ToolExecutionError
@@ -49,3 +50,22 @@ def test_tool_executor_is_extendable_with_custom_tools():
 
     assert executor.execute("echo", {"x": 1}) == {"echoed": {"x": 1}}
     assert executor.execute("search", {"query": "still works"})["query"] == "still works"
+
+
+def test_tool_executor_dispatches_to_notes_tool(workflow_session_factory):
+    executor = ToolExecutor(tools=[SearchTool(), NotesTool(session_factory=workflow_session_factory)])
+
+    result = executor.execute("notes", {"action": "list"})
+
+    assert result["observation"] == "notes_listed"
+    assert result["total"] == 0
+
+
+def test_tool_executor_default_registry_includes_search_and_notes():
+    # Regression check: adding NotesTool must not remove or shadow SearchTool.
+    executor = ToolExecutor()
+
+    assert "search" in executor._tools
+    assert "notes" in executor._tools
+    assert isinstance(executor._tools["search"], SearchTool)
+    assert isinstance(executor._tools["notes"], NotesTool)

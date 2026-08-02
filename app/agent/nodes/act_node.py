@@ -1,8 +1,4 @@
-"""Act node: executes the selected tool (Search) and records its result.
-
-Only the Search tool is available in Milestone 6. The execution still goes
-through ToolExecutor so future tools can be added without changing this node.
-"""
+"""Act node: executes the tool selected by the Plan node."""
 
 from typing import Any
 
@@ -22,12 +18,17 @@ def build_act_node(tool_executor: ToolExecutor):
             state["workflow_id"],
         )
 
-        tool_name = "search"
-        tool_input: dict[str, Any] = {
-            "query": state["intent"] or state["user_message"],
-        }
+        # Use the tool selected by the Plan node.
+        tool_name = state.get("tool_name") or "search"
 
-        # Always record tool information, even if execution fails.
+        tool_input: dict[str, Any] = (
+            state.get("tool_input")
+            or {
+                "query": state["intent"] or state["user_message"],
+            }
+        )
+
+        # Always record tool information.
         state["tool_name"] = tool_name
         state["tool_input"] = tool_input
 
@@ -57,8 +58,6 @@ def build_act_node(tool_executor: ToolExecutor):
             state["status"] = "FAILED"
             state["current_step"] = "OBSERVE"
 
-            # IMPORTANT:
-            # Tests expect metadata["error"], not metadata["act_error"].
             state["metadata"] = {
                 **state["metadata"],
                 "error": str(exc),
