@@ -1,11 +1,21 @@
-"""Tests for AgentService.
 
-Both the LLM client and WorkflowService are fakes, so no real Groq API,
-LangGraph side effects, or database are touched.
+"""Tests for AgentService 4-node graph.
+
+Covers:
+- REASON node
+- PLAN node
+- ACT node
+- OBSERVE node
+- final_response handling
+- tool failure path
+- unexpected errors
+
+No real Groq API or database is used.
 """
 
 import pytest
 
+from app.core.exceptions import ToolExecutionError
 from app.services.agent_service import AgentService
 
 
@@ -17,18 +27,16 @@ class _FakeLLMClient:
         return self._responses.pop(0)
 
 
-class _BoomLLMClient:
-    def generate(self, prompt: str) -> str:
-        raise RuntimeError("boom")
+class _FailingToolExecutor:
+    def execute(self, tool_name: str, tool_input: dict) -> dict:
+        raise ToolExecutionError("search backend down")
 
 
 class _FakeWorkflowService:
-    """In-memory fake implementation of WorkflowService."""
-
     def __init__(self) -> None:
-        self.created_prompts: list[str] = []
-        self.recorded_steps: list[dict] = []
-        self.finalized: list[dict] = []
+        self.created_prompts = []
+        self.recorded_steps = []
+        self.finalized = []
         self._next_id = 1
 
     def create_workflow(self, user_prompt: str) -> str:
@@ -45,7 +53,7 @@ class _FakeWorkflowService:
         node_type,
         input_data,
         output_data,
-    ) -> None:
+    ):
         self.recorded_steps.append(
             {
                 "workflow_id": workflow_id,
@@ -61,20 +69,22 @@ class _FakeWorkflowService:
         status,
         final_response=None,
         tools_used=None,
-    ) -> None:
+    ):
         self.finalized.append(
             {
                 "workflow_id": workflow_id,
                 "status": status,
+                "final_response": final_response,
             }
         )
 
 
-def test_agent_service_run_returns_intent_and_plan():
+def test_agent_service_returns_final_response():
     llm = _FakeLLMClient(
         [
             "Book a flight",
             '["Search flights", "Confirm booking"]',
+            "Your flight information is ready.",
         ]
     )
 
@@ -87,17 +97,28 @@ def test_agent_service_run_returns_intent_and_plan():
 
     result = service.run("Book me a flight to Paris")
 
-    assert result["workflow_id"] == "fake-wf-1"
     assert result["intent"] == "Book a flight"
+
     assert result["plan"] == [
         "Search flights",
         "Confirm booking",
     ]
+
+    assert result["final_response"] == (
+        "Your flight information is ready."
+    )
+
     assert result["status"] == "COMPLETED"
 
 
-def test_agent_service_creates_workflow():
-    llm = _FakeLLMClient(["intent", "[]"])
+def test_agent_service_creates_workflow_with_user_prompt():
+    llm = _FakeLLMClient(
+        [
+            "intent",
+            "[]",
+            "final",
+        ]
+    )
 
     workflow_service = _FakeWorkflowService()
 
@@ -113,11 +134,13 @@ def test_agent_service_creates_workflow():
     ]
 
 
-def test_agent_service_records_reason_and_plan_steps():
+def test_agent_service_records_all_four_nodes():
+
     llm = _FakeLLMClient(
         [
             "intent",
             '["step one"]',
+            "final answer",
         ]
     )
 
@@ -130,17 +153,26 @@ def test_agent_service_records_reason_and_plan_steps():
 
     service.run("Hello")
 
-    assert len(workflow_service.recorded_steps) == 2
+    node_types = [
+        step["node_type"]
+        for step in workflow_service.recorded_steps
+    ]
 
-    assert workflow_service.recorded_steps[0]["node_type"] == "REASON"
-    assert workflow_service.recorded_steps[1]["node_type"] == "PLAN"
+    assert node_types == [
+        "REASON",
+        "PLAN",
+        "ACT",
+        "OBSERVE",
+    ]
 
 
-def test_agent_service_finalizes_completed_workflow():
+def test_agent_service_finalizes_completed_with_response():
+
     llm = _FakeLLMClient(
         [
             "intent",
             "[]",
+            "Completed successfully",
         ]
     )
 
@@ -157,11 +189,44 @@ def test_agent_service_finalizes_completed_workflow():
         {
             "workflow_id": result["workflow_id"],
             "status": "COMPLETED",
+            "final_response": "Completed successfully",
         }
     ]
 
 
-def test_agent_service_finalizes_failed_workflow():
+def test_agent_service_handles_tool_failure():
+
+    llm = _FakeLLMClient(
+        [
+            "intent",
+            "[]",
+        ]
+    )
+
+    workflow_service = _FakeWorkflowService()
+
+    service = AgentService(
+        llm_client=llm,
+        workflow_service=workflow_service,
+        tool_executor=_FailingToolExecutor(),
+    )
+
+    result = service.run("Search something")
+
+    assert result["status"] == "FAILED"
+
+    assert result["final_response"]
+
+    assert workflow_service.finalized[0]["status"] == "FAILED"
+
+
+def test_agent_service_finalizes_failed_on_unexpected_exception():
+
+    class _BoomLLMClient:
+        def generate(self, prompt: str):
+            raise RuntimeError("boom")
+
+
     workflow_service = _FakeWorkflowService()
 
     service = AgentService(
@@ -172,9 +237,9 @@ def test_agent_service_finalizes_failed_workflow():
     with pytest.raises(RuntimeError):
         service.run("Hello")
 
-    assert workflow_service.finalized == [
-        {
-            "workflow_id": "fake-wf-1",
-            "status": "FAILED",
-        }
-    ]
+
+    assert workflow_service.finalized[0] == {
+        "workflow_id": "fake-wf-1",
+        "status": "FAILED",
+        "final_response": None,
+    }

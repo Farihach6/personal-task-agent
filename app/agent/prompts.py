@@ -1,60 +1,67 @@
-"""Prompt templates for the agent's Reason and Plan nodes.
+"""Prompt templates for the agent's Reason, Plan, and Observe nodes.
 
-Centralizing prompt text here keeps prompts versioned separately from node
-logic and makes future prompt tuning easier.
+Centralizing prompt text here makes prompts easy to review, version,
+and improve independently of the node logic.
 """
 
-REASON_PROMPT_TEMPLATE = """You are the reasoning module of an AI Personal Task Agent.
+REASON_PROMPT_TEMPLATE = """You are the reasoning module of a personal task assistant.
 
-Your task is to identify the user's primary intent.
+Read the user's message and identify their underlying intent.
 
 User message:
 {user_message}
 
-Rules:
-- Return ONLY the intent.
-- Use 2–5 lowercase words.
-- Do not include punctuation.
-- Do not explain your reasoning.
-- Do not return JSON.
-
-Examples:
-
-User: Research AI agents and save notes
-Intent:
-research and note taking
-
-User: Send an email to John
-Intent:
-send email
-
-User: Show my notes
-Intent:
-view notes
+Respond with ONLY the intent as a short phrase (3–6 words).
+Do not include explanations or extra text.
 """
 
-PLAN_PROMPT_TEMPLATE = """You are the planning module of an AI Personal Task Agent.
 
-Create a short execution plan based on the user's request.
+PLAN_PROMPT_TEMPLATE = """You are the planning module of a personal task assistant.
+
+Given the user's message and identified intent, produce a short ordered
+list of steps needed to complete the task.
 
 User message:
 {user_message}
 
-Detected intent:
+Intent:
 {intent}
 
-Rules:
-- Return ONLY a valid JSON array.
-- Each item must be a single actionable step.
-- Do not execute anything.
-- Do not mention tools unless necessary.
-- Do not add explanations or markdown.
+Respond ONLY with a valid JSON array of strings.
 
 Example:
-
 [
-  "Search information about AI agents",
-  "Summarize important findings",
-  "Save the summary as notes"
+  "Search for nearby restaurants",
+  "Compare ratings",
+  "Return the top 3 options"
 ]
+"""
+
+
+OBSERVE_PROMPT_TEMPLATE = """You are the response module of a personal task assistant.
+
+Use the information below to produce the final response for the user.
+
+User message:
+{user_message}
+
+Intent:
+{intent}
+
+Plan:
+{plan}
+
+Search result:
+{tool_result}
+
+Instructions:
+
+- Summarize the search results naturally.
+- Answer the user's request clearly.
+- Do NOT mention internal planning.
+- Do NOT mention tools.
+- Do NOT mention JSON.
+- Keep the response concise and helpful.
+
+Respond ONLY with the final answer.
 """

@@ -1,11 +1,12 @@
-"""Tests for the Reason -> Plan LangGraph graph."""
+"""Tests for the Reason -> Plan -> Act -> Observe LangGraph graph."""
 
 from app.agent.graph import build_graph
 from app.agent.state import create_initial_state
+from app.core.exceptions import ToolExecutionError
 
 
 class _FakeLLMClient:
-    """Stand-in for GroqClient so graph tests never touch the real SDK."""
+    """Fake LLM client so graph tests never call real Groq API."""
 
     def __init__(self, responses: list[str]) -> None:
         self._responses = list(responses)
@@ -16,45 +17,82 @@ class _FakeLLMClient:
         return self._responses.pop(0)
 
 
-def test_graph_populates_intent_and_plan():
+class _FailingToolExecutor:
+    """Fake tool executor used for failure testing."""
+
+    def execute(
+        self,
+        tool_name: str,
+        tool_input: dict,
+    ) -> dict:
+        raise ToolExecutionError("search backend down")
+
+
+def test_graph_executes_all_four_nodes_and_produces_final_response():
     fake_client = _FakeLLMClient(
         responses=[
-            "Book a flight",
-            '["Search flights", "Pick cheapest", "Confirm booking"]',
+            "Find restaurants",
+            '["Search restaurants", "Pick best one"]',
+            "Here are some great restaurant options nearby.",
         ]
     )
 
     graph = build_graph(fake_client)
 
     final_state = graph.invoke(
-        create_initial_state("wf-1", "Book me a flight to Paris")
+        create_initial_state(
+            "wf-1",
+            "Find me a good restaurant",
+        )
     )
 
-    assert final_state["intent"] == "Book a flight"
+    assert final_state["intent"] == "Find restaurants"
+
     assert final_state["plan"] == [
-        "Search flights",
-        "Pick cheapest",
-        "Confirm booking",
+        "Search restaurants",
+        "Pick best one",
     ]
+
+    assert final_state["tool_name"] == "search"
+
+    assert final_state["tool_result"] is not None
+
+    assert final_state["final_response"] == (
+        "Here are some great restaurant options nearby."
+    )
+
     assert final_state["status"] == "COMPLETED"
     assert final_state["current_step"] == "DONE"
 
 
-def test_graph_calls_reason_before_plan_with_correct_prompts():
+def test_graph_calls_reason_plan_observe_in_order_with_correct_prompts():
     fake_client = _FakeLLMClient(
         responses=[
             "Order food",
             '["Pick a restaurant", "Place order"]',
+            "Your order is on its way!",
         ]
     )
 
     graph = build_graph(fake_client)
 
-    graph.invoke(create_initial_state("wf-2", "I'm hungry, order me dinner"))
+    graph.invoke(
+        create_initial_state(
+            "wf-2",
+            "I'm hungry, order me dinner",
+        )
+    )
 
-    assert len(fake_client.calls) == 2
+    assert len(fake_client.calls) == 3
+
+    # Reason prompt
     assert "I'm hungry, order me dinner" in fake_client.calls[0]
+
+    # Plan prompt receives intent
     assert "Order food" in fake_client.calls[1]
+
+    # Observe prompt receives context
+    assert "Order food" in fake_client.calls[2]
 
 
 def test_graph_falls_back_to_single_step_plan_on_malformed_json():
@@ -62,16 +100,23 @@ def test_graph_falls_back_to_single_step_plan_on_malformed_json():
         responses=[
             "Do something",
             "not valid json at all",
+            "Done.",
         ]
     )
 
     graph = build_graph(fake_client)
 
     final_state = graph.invoke(
-        create_initial_state("wf-3", "Do the thing")
+        create_initial_state(
+            "wf-3",
+            "Do the thing",
+        )
     )
 
-    assert final_state["plan"] == ["Respond to: Do the thing"]
+    assert final_state["plan"] == [
+        "Respond to: Do the thing"
+    ]
+
     assert final_state["status"] == "COMPLETED"
 
 
@@ -80,33 +125,49 @@ def test_graph_preserves_workflow_id():
         responses=[
             "intent",
             "[]",
+            "ok",
         ]
     )
 
     graph = build_graph(fake_client)
 
     final_state = graph.invoke(
-        create_initial_state("wf-preserved", "Hello")
+        create_initial_state(
+            "wf-preserved",
+            "Hello",
+        )
     )
 
     assert final_state["workflow_id"] == "wf-preserved"
 
 
-def test_graph_preserves_metadata():
-    """Metadata from both nodes should be available in the final state."""
-
+def test_graph_marks_failed_when_tool_execution_fails():
     fake_client = _FakeLLMClient(
         responses=[
-            "Book a flight",
-            '["Search flights"]',
+            "intent",
+            "[]",
         ]
     )
 
-    graph = build_graph(fake_client)
-
-    final_state = graph.invoke(
-        create_initial_state("wf-meta", "Book me a flight")
+    graph = build_graph(
+        fake_client,
+        tool_executor=_FailingToolExecutor(),
     )
 
-    assert "reason_raw_response" in final_state["metadata"]
-    assert "plan_raw_response" in final_state["metadata"]
+    final_state = graph.invoke(
+        create_initial_state(
+            "wf-4",
+            "Hello",
+        )
+    )
+
+    assert final_state["status"] == "FAILED"
+
+    assert (
+        "error"
+        in final_state["metadata"]
+    )
+
+    assert final_state["final_response"] is not None
+
+    assert final_state["current_step"] == "DONE"
