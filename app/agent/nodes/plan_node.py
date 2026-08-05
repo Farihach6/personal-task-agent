@@ -1,6 +1,7 @@
 """Plan node: turns the identified intent into an ordered list of steps."""
 
 import re
+from typing import Any
 
 from app.agent.prompts import PLAN_PROMPT_TEMPLATE
 from app.agent.state import AgentState
@@ -33,13 +34,97 @@ def _parse_plan(raw_response: str, fallback_message: str) -> list[str]:
     return [f"Respond to: {fallback_message}"]
 
 
+# -----------------------
+# Email routing
+# -----------------------
+
+_EMAIL_INTENT_PATTERN = re.compile(
+    r"\b(email|mail|compose|send a message to)\b",
+    re.IGNORECASE,
+)
+
+_EMAIL_ADDRESS_PATTERN = re.compile(
+    r"[\w.\-+]+@[\w\-]+\.[\w.\-]+"
+)
+
+_EMAIL_SUBJECT_PATTERN = re.compile(
+    r"subject\s*[:\-]\s*(.+?)(?:\.\s|$)",
+    re.IGNORECASE,
+)
+
+_EMAIL_BODY_CONNECTOR_PATTERN = re.compile(
+    r"^(that|saying|:|-)\s*",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_email_request(text: str) -> bool:
+    return (
+
+        bool(_EMAIL_INTENT_PATTERN.search(text))
+        and bool(_EMAIL_ADDRESS_PATTERN.search(text))
+    )
+    
+
+
+def _extract_email_address(user_message: str) -> str | None:
+    match = _EMAIL_ADDRESS_PATTERN.search(user_message)
+    return match.group() if match else None
+
+
+def _extract_email_subject(
+    user_message: str,
+    intent: str,
+) -> str:
+    match = _EMAIL_SUBJECT_PATTERN.search(user_message)
+
+    if match:
+        return match.group(1).strip()
+
+    return intent or "Message from your assistant"
+
+
+def _extract_email_body(user_message: str) -> str:
+    match = _EMAIL_ADDRESS_PATTERN.search(user_message)
+
+    if not match:
+        return user_message.strip()
+
+    remainder = user_message[match.end():].strip()
+    remainder = _EMAIL_BODY_CONNECTOR_PATTERN.sub(
+        "",
+        remainder,
+    ).strip()
+
+    return remainder or user_message.strip()
+
+
 def _determine_tool_call(
     user_message: str,
     intent: str,
-) -> tuple[str, dict]:
+) -> tuple[str, dict[str, Any]]:
     """Determine which tool should execute the request."""
 
     message = user_message.lower()
+
+    # -----------------------
+    # Email
+    # -----------------------
+
+    if _looks_like_email_request(message):
+        return (
+            "email",
+            {
+                "to": _extract_email_address(user_message),
+                "subject": _extract_email_subject(
+                    user_message,
+                    intent,
+                ),
+                "body": _extract_email_body(
+                    user_message,
+                ),
+            },
+        )
 
     # -----------------------
     # Create note
@@ -64,10 +149,13 @@ def _determine_tool_call(
             "save note",
             "remember that",
             "remember",
+            "save note that", 
             "take a note that",
             "take a note",
             "create a note that",
             "create a note",
+            "create note that",
+            "create note",
             "note that",
         ]
 
@@ -83,6 +171,7 @@ def _determine_tool_call(
             {
                 "action": "create",
                 "content": content,
+                "title": content[:60],
             },
         )
 
@@ -120,14 +209,17 @@ def _determine_tool_call(
         re.IGNORECASE,
     )
     if match:
-        return (
-            "notes",
-            {
-                "action": "update",
-                "note_id": int(match.group(1)),
-                "content": match.group(2).strip(),
-            },
-        )
+        tool_input: dict[str, Any] = {
+            "action": "update",
+            "note_id": int(match.group(1)),
+        }
+
+        content = match.group(2).strip()
+
+        if content:
+            tool_input["content"] = content
+
+        return "notes", tool_input
 
     # -----------------------
     # Get note
@@ -191,6 +283,7 @@ def build_plan_node(llm_client: GroqClient):
             state["metadata"] = {
                 **state["metadata"],
                 "plan_raw_response": raw_response,
+                "selected_tool": tool_name,
             }
 
             logger.info(

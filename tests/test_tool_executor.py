@@ -2,6 +2,7 @@
 
 import pytest
 
+from app.agent.tools.email_tool import EmailTool
 from app.agent.tools.notes_tool import NotesTool
 from app.agent.tools.search_tool import SearchTool
 from app.agent.tools.tool_executor import ToolExecutor
@@ -61,11 +62,46 @@ def test_tool_executor_dispatches_to_notes_tool(workflow_session_factory):
     assert result["total"] == 0
 
 
-def test_tool_executor_default_registry_includes_search_and_notes():
-    # Regression check: adding NotesTool must not remove or shadow SearchTool.
+def test_tool_executor_default_registry_includes_search_notes_and_email():
+    # Regression check: adding EmailTool must not remove or shadow the
+    # existing SearchTool/NotesTool registrations.
     executor = ToolExecutor()
 
     assert "search" in executor._tools
     assert "notes" in executor._tools
+    assert "email" in executor._tools
     assert isinstance(executor._tools["search"], SearchTool)
     assert isinstance(executor._tools["notes"], NotesTool)
+    assert isinstance(executor._tools["email"], EmailTool)
+
+
+def test_tool_executor_dispatches_to_email_tool():
+    class _FakeEmailService:
+        def send_email(self, to, subject, body):
+            return {"sent": True, "simulated": False, "to": to, "subject": subject,"body": body,}
+
+    executor = ToolExecutor(
+        tools=[SearchTool(), EmailTool(email_service=_FakeEmailService())]
+    )
+
+    result = executor.execute("email", {"to": "jane@example.com", "body": "Hi Jane"})
+
+    assert result["observation"] == "email_sent"
+    assert result["to"] == "jane@example.com"
+
+
+def test_tool_executor_requires_approval_true_for_email():
+    executor = ToolExecutor()
+    assert executor.requires_approval("email") is True
+
+
+def test_tool_executor_requires_approval_false_for_search_and_notes():
+    executor = ToolExecutor()
+    assert executor.requires_approval("search") is False
+    assert executor.requires_approval("notes") is False
+
+
+def test_tool_executor_requires_approval_raises_for_unknown_tool():
+    executor = ToolExecutor()
+    with pytest.raises(ToolExecutionError):
+        executor.requires_approval("nonexistent_tool")

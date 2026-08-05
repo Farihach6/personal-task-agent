@@ -2,13 +2,17 @@
 
 from app.agent.nodes.act_node import build_act_node
 from app.agent.state import create_initial_state
+from app.agent.tools.tool_executor import ToolExecutor
 from app.core.exceptions import ToolExecutionError
 
 
 class _FakeToolExecutor:
-    def __init__(self, result=None, error: Exception | None = None) -> None:
+    def __init__(
+        self, result=None, error: Exception | None = None, requires_approval_value: bool = False
+    ) -> None:
         self.result = result
         self.error = error
+        self.requires_approval_value = requires_approval_value
         self.calls: list[tuple[str, dict]] = []
 
     def execute(self, tool_name: str, tool_input: dict) -> dict:
@@ -16,6 +20,9 @@ class _FakeToolExecutor:
         if self.error is not None:
             raise self.error
         return self.result
+
+    def requires_approval(self, tool_name: str) -> bool:
+        return self.requires_approval_value
 
 
 def test_act_node_executes_search_and_stores_result():
@@ -68,3 +75,53 @@ def test_act_node_records_tool_name_and_input_even_on_failure():
 
     assert result["tool_name"] == "search"
     assert result["tool_input"] == {"query": "sushi"}
+
+
+def test_act_node_pauses_for_approval_when_tool_requires_it():
+    fake_executor = _FakeToolExecutor(
+        result={"observation": "email_sent"}, requires_approval_value=True
+    )
+    node = build_act_node(fake_executor)
+
+    state = create_initial_state("wf-5", "Send an email to john@example.com saying hi")
+    state["tool_name"] = "email"
+    state["tool_input"] = {"to": "john@example.com", "subject": "Hi", "body": "hi"}
+    result = node(state)
+
+    assert result["status"] == "WAITING_APPROVAL"
+    assert result["current_step"] == "AWAITING_APPROVAL"
+    assert result["metadata"]["approval_required"] is True
+
+
+def test_act_node_does_not_execute_tool_when_paused_for_approval():
+    fake_executor = _FakeToolExecutor(
+        result={"observation": "email_sent"}, requires_approval_value=True
+    )
+    node = build_act_node(fake_executor)
+
+    state = create_initial_state("wf-6", "Send an email to john@example.com saying hi")
+    state["tool_name"] = "email"
+    state["tool_input"] = {"to": "john@example.com", "body": "hi"}
+    result = node(state)
+
+    assert fake_executor.calls == []
+    assert result["tool_result"] is None
+
+
+def test_act_node_marks_failed_when_tool_name_is_unrecognized():
+    """Regression: if the planner ever selects a tool_name the executor
+    doesn't recognize, ToolExecutor.requires_approval() raises before
+    execution even starts — Act must still catch this and fail gracefully
+    rather than crash the graph."""
+    real_executor = ToolExecutor()  # default registry: search, notes, email — no "carrier_pigeon"
+    node = build_act_node(real_executor)
+
+    state = create_initial_state("wf-7", "Do something unusual")
+    state["tool_name"] = "carrier_pigeon"
+    state["tool_input"] = {}
+    result = node(state)
+
+    assert result["status"] == "FAILED"
+    assert result["current_step"] == "OBSERVE"
+    assert result["tool_result"] is None
+    assert "error" in result["metadata"]

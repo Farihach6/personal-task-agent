@@ -136,3 +136,31 @@ def test_graph_still_routes_to_search_when_notes_tool_is_registered():
 
     assert final_state["tool_name"] == "search"
     assert final_state["status"] == "COMPLETED"
+
+
+class _RequiresApprovalToolExecutor:
+    """A fake tool executor whose sole tool always requires approval, and
+    whose execute() would fail the test if ever called before approval."""
+
+    def execute(self, tool_name: str, tool_input: dict) -> dict:
+        raise AssertionError("Tool must not execute before approval is granted")
+
+    def requires_approval(self, tool_name: str) -> bool:
+        return True
+
+
+def test_graph_pauses_before_observe_when_tool_requires_approval():
+    """Only reason and plan call the LLM; the conditional edge routes
+    straight to END after Act pauses, so Observe (and its LLM call) never runs."""
+    fake_client = _FakeLLMClient(responses=["Send an email", '["Send the email"]'])
+    graph = build_graph(fake_client, tool_executor=_RequiresApprovalToolExecutor())
+
+    final_state = graph.invoke(
+        create_initial_state("wf-approval", "Send an email to john@example.com saying hi")
+    )
+
+    assert final_state["status"] == "WAITING_APPROVAL"
+    assert final_state["current_step"] == "AWAITING_APPROVAL"
+    assert final_state["tool_result"] is None
+    assert final_state.get("final_response") is None
+    assert len(fake_client.calls) == 2  # reason + plan only; observe was skipped

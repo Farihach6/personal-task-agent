@@ -140,3 +140,44 @@ def test_plan_node_falls_back_to_search_for_non_note_requests():
 
     assert result["tool_name"] == "search"
     assert result["tool_input"] == {"query": "Find pizza"}
+
+
+def test_plan_node_selects_email_action_when_message_has_an_email_address():
+    fake_client = _FakeLLMClient('["Send the email"]')
+    node = build_plan_node(fake_client)
+
+    state = create_initial_state(
+        "wf-12", "Send an email to john@example.com saying the meeting is at 3pm"
+    )
+    result = node(state)
+
+    assert result["tool_name"] == "email"
+    assert result["tool_input"]["to"] == "john@example.com"
+    assert "3pm" in result["tool_input"]["body"]
+
+
+def test_plan_node_extracts_explicit_email_subject_when_provided():
+    fake_client = _FakeLLMClient('["Send the email"]')
+    node = build_plan_node(fake_client)
+
+    state = create_initial_state(
+        "wf-13", "Email jane@example.com Subject: Project Update. The launch is on track."
+    )
+    result = node(state)
+
+    assert result["tool_name"] == "email"
+    assert result["tool_input"]["to"] == "jane@example.com"
+    assert result["tool_input"]["subject"] == "Project Update"
+
+
+def test_plan_node_does_not_route_to_email_without_an_email_address():
+    """Regression: mentioning 'email' without an actual address (e.g.
+    'check my email') must not be misrouted to the Email tool."""
+    fake_client = _FakeLLMClient('["Check email"]')
+    node = build_plan_node(fake_client)
+
+    state = create_initial_state("wf-14", "Did I get any new email today?")
+    state["intent"] = "Check email"
+    result = node(state)
+
+    assert result["tool_name"] == "search"

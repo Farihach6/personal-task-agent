@@ -33,12 +33,32 @@ def build_act_node(tool_executor: ToolExecutor):
         state["tool_input"] = tool_input
 
         try:
+            # Pause before executing sensitive tools.
+            if tool_executor.requires_approval(tool_name):
+                logger.info(
+                    "Approval required before executing tool '%s'.",
+                    tool_name,
+                )
+
+                state["tool_result"] = None
+                state["status"] = "WAITING_APPROVAL"
+                state["current_step"] = "AWAITING_APPROVAL"
+
+                state["metadata"] = {
+                    **state["metadata"],
+                    "approval_required": True,
+                    "act_tool_used": tool_name,
+                }
+
+                return state
+
             tool_result = tool_executor.execute(
                 tool_name=tool_name,
                 tool_input=tool_input,
             )
 
             state["tool_result"] = tool_result
+            state["status"] = "RUNNING"
             state["current_step"] = "OBSERVE"
 
             state["metadata"] = {

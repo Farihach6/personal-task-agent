@@ -4,10 +4,11 @@ dedicated end-to-end test which uses the isolated in-memory test database."""
 
 import pytest
 
+from app.agent.tools.email_tool import EmailTool
 from app.agent.tools.notes_tool import NotesTool
 from app.agent.tools.search_tool import SearchTool
 from app.agent.tools.tool_executor import ToolExecutor
-from app.core.exceptions import ToolExecutionError
+from app.core.exceptions import GuardrailViolation, ToolExecutionError
 from app.database.repositories import NoteRepository, WorkflowStepRepository
 from app.services.agent_service import AgentService
 from app.services.workflow_service import WorkflowService
@@ -33,6 +34,7 @@ class _FakeWorkflowService:
         self.created_prompts: list[str] = []
         self.recorded_steps: list[dict] = []
         self.finalized: list[dict] = []
+        self.awaiting_approval: list[str] = []
         self._next_id = 1
 
     def create_workflow(self, user_prompt: str) -> str:
@@ -51,10 +53,26 @@ class _FakeWorkflowService:
             }
         )
 
-    def finalize_workflow(self, workflow_id, status, final_response=None, tools_used=None) -> None:
+    def finalize_workflow(
+        self, workflow_id, status, final_response=None, tools_used=None, approval_status=None
+    ) -> None:
         self.finalized.append(
-            {"workflow_id": workflow_id, "status": status, "final_response": final_response}
+            {
+                "workflow_id": workflow_id,
+                "status": status,
+                "final_response": final_response,
+                "approval_status": approval_status,
+            }
         )
+
+    def mark_awaiting_approval(self, workflow_id: str) -> None:
+        self.awaiting_approval.append(workflow_id)
+
+    def get_pending_approvals(self) -> list[dict]:
+        return [{"workflow_id": wf_id} for wf_id in self.awaiting_approval]
+
+    def get_workflow_context(self, workflow_id: str) -> dict:
+        return getattr(self, "_context", {})
 
 
 def test_agent_service_run_returns_full_result_with_final_response():
@@ -106,6 +124,7 @@ def test_agent_service_run_finalizes_workflow_with_final_response():
             "workflow_id": result["workflow_id"],
             "status": "COMPLETED",
             "final_response": "Here's the answer.",
+            "approval_status": None,
         }
     ]
 
@@ -181,3 +200,153 @@ def test_agent_service_run_still_uses_search_end_to_end_for_non_note_requests(
 
     assert result["status"] == "COMPLETED"
     assert NoteRepository(db_session).count() == 0
+
+
+class _RequiresApprovalToolExecutor:
+    def execute(self, tool_name: str, tool_input: dict) -> dict:
+        raise AssertionError("Tool must not execute before approval is granted")
+
+    def requires_approval(self, tool_name: str) -> bool:
+        return True
+
+
+def test_agent_service_run_pauses_workflow_when_tool_requires_approval():
+    llm = _FakeLLMClient(["Send an email", '["Send the email"]'])
+    workflow_service = _FakeWorkflowService()
+    service = AgentService(
+        llm_client=llm,
+        workflow_service=workflow_service,
+        tool_executor=_RequiresApprovalToolExecutor(),
+    )
+
+    result = service.run("Send an email to john@example.com saying hi")
+
+    assert result["status"] == "WAITING_APPROVAL"
+    assert result["workflow_id"] in workflow_service.awaiting_approval
+    assert workflow_service.finalized == []  # a paused workflow is not finalized
+
+
+class _FakeEmailService:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def send_email(self, to: str, subject: str, body: str) -> dict:
+        self.calls.append({"to": to, "subject": subject, "body": body})
+        return {"sent": True, "simulated": False, "to": to, "subject": subject,"body": body,  }
+
+
+def test_agent_service_resume_approves_and_sends_the_email(workflow_session_factory, db_session):
+    """Full pause -> approve -> execute -> observe -> finalize lifecycle
+    against the isolated test database. Only the LLM client is faked."""
+    workflow_service = WorkflowService(session_factory=workflow_session_factory)
+    fake_email_service = _FakeEmailService()
+    tool_executor = ToolExecutor(
+        tools=[SearchTool(), EmailTool(email_service=fake_email_service)]
+    )
+
+    pause_llm = _FakeLLMClient(["Send an email", '["Send the email"]'])
+    service = AgentService(
+        llm_client=pause_llm, workflow_service=workflow_service, tool_executor=tool_executor
+    )
+    paused = service.run("Send an email to john@example.com saying the meeting is at 3pm")
+    assert paused["status"] == "WAITING_APPROVAL"
+
+    resume_llm = _FakeLLMClient(["I've sent your email."])
+    resume_service = AgentService(
+        llm_client=resume_llm, workflow_service=workflow_service, tool_executor=tool_executor
+    )
+    result = resume_service.resume(paused["workflow_id"], approved=True)
+
+    assert result["status"] == "COMPLETED"
+    assert result["final_response"] == "I've sent your email."
+    assert fake_email_service.calls == [
+        {"to": "john@example.com", "subject": "Send an email", "body": "the meeting is at 3pm"}
+    ]
+
+    steps = WorkflowStepRepository(db_session).get_by_workflow(paused["workflow_id"])
+    assert [s.node_type for s in steps] == ["REASON", "PLAN", "ACT", "ACT", "OBSERVE"]
+
+
+def test_agent_service_resume_rejects_and_never_sends_the_email(workflow_session_factory, db_session):
+    workflow_service = WorkflowService(session_factory=workflow_session_factory)
+    fake_email_service = _FakeEmailService()
+    tool_executor = ToolExecutor(
+        tools=[SearchTool(), EmailTool(email_service=fake_email_service)]
+    )
+
+    pause_llm = _FakeLLMClient(["Send an email", '["Send the email"]'])
+    service = AgentService(
+        llm_client=pause_llm, workflow_service=workflow_service, tool_executor=tool_executor
+    )
+    paused = service.run("Send an email to jane@example.com saying hello")
+    assert paused["status"] == "WAITING_APPROVAL"
+
+    reject_llm = _FakeLLMClient(["Okay, I won't send that email."])
+    resume_service = AgentService(
+        llm_client=reject_llm, workflow_service=workflow_service, tool_executor=tool_executor
+    )
+    result = resume_service.resume(paused["workflow_id"], approved=False)
+
+    assert result["status"] == "COMPLETED"
+    assert result["final_response"] == "Okay, I won't send that email."
+    assert fake_email_service.calls == []  # never actually sent
+
+    from app.database.repositories import WorkflowRepository
+
+    workflow = WorkflowRepository(db_session).get_by_id(paused["workflow_id"])
+    assert workflow.approval_status == "REJECTED"
+
+
+def test_agent_service_pending_approvals_list_clears_after_resume(
+    workflow_session_factory, db_session
+):
+    workflow_service = WorkflowService(session_factory=workflow_session_factory)
+    tool_executor = ToolExecutor(
+        tools=[SearchTool(), EmailTool(email_service=_FakeEmailService())]
+    )
+
+    llm = _FakeLLMClient(["Send an email", '["Send the email"]'])
+    service = AgentService(llm_client=llm, workflow_service=workflow_service, tool_executor=tool_executor)
+    paused = service.run("Send an email to john@example.com saying hi")
+
+    assert len(workflow_service.get_pending_approvals()) == 1
+
+    resume_llm = _FakeLLMClient(["Sent."])
+    resume_service = AgentService(
+        llm_client=resume_llm, workflow_service=workflow_service, tool_executor=tool_executor
+    )
+    resume_service.resume(paused["workflow_id"], approved=True)
+
+    # Ensures the workflow is removed from the pending list once resumed.
+    assert workflow_service.get_pending_approvals() == []
+
+
+def test_agent_service_resume_rejects_already_completed_workflow():
+    """Idempotency guard (Fix #1): resuming/approving a workflow that has
+    already been finalized (status != WAITING_APPROVAL) must raise
+    GuardrailViolation instead of re-executing the tool a second time."""
+    workflow_service = _FakeWorkflowService()
+    workflow_service._context = {
+        "user_message": "Send an email",
+        "status": "COMPLETED",
+        "approval_status": "APPROVED",
+        "intent": "Send an email",
+        "plan": ["Send the email"],
+        "tool_name": "email",
+        "tool_input": {
+            "to": "john@example.com",
+            "subject": "Hi",
+            "body": "Hello",
+        },
+    }
+
+    service = AgentService(
+        llm_client=_FakeLLMClient([]),
+        workflow_service=workflow_service,
+        tool_executor=ToolExecutor(
+            tools=[SearchTool(), EmailTool(email_service=_FakeEmailService())]
+        ),
+    )
+
+    with pytest.raises(GuardrailViolation):
+        service.resume("fake-wf-1", approved=True)

@@ -15,6 +15,7 @@
         <button class="tab-btn active" data-tab="chat">Chat</button>
         <button class="tab-btn" data-tab="history">Workflow History</button>
         <button class="tab-btn" data-tab="notes">Notes</button>
+        <button class="tab-btn" data-tab="approvals">Approvals</button>
         <button class="tab-btn" data-tab="logs">Logs</button>
       </nav>
     </header>
@@ -44,6 +45,16 @@
         <div id="notes-pagination" class="pagination"></div>
       </section>
 
+      <section id="tab-approvals" class="tab-panel">
+        <div class="approvals-toolbar">
+          <p class="approvals-hint">Sensitive actions (like sending email) pause here until you approve or reject them.</p>
+          <button id="approvals-refresh-btn" class="btn btn-secondary">Refresh</button>
+        </div>
+
+        <div id="approvals-state" class="notes-state"></div>
+        <div id="approvals-list" class="approvals-list"></div>
+      </section>
+
       <section id="tab-logs" class="tab-panel">
         <p class="placeholder">Execution logs viewer will be implemented in a later milestone.</p>
       </section>
@@ -70,6 +81,7 @@
   <script src="js/chat.js"></script>
   <script src="js/history.js"></script>
   <script src="js/notes.js"></script>
+  <script src="js/approvals.js"></script>
   <script src="js/logs.js"></script>
   <script>
     // Minimal tab-switching logic; each panel's real behavior arrives with its milestone.
