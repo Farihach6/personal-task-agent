@@ -1,4 +1,7 @@
-"""Plan node: turns the identified intent into an ordered list of steps."""
+"""Plan node: turns the identified intent into an ordered list of steps,
+and determines which tool (search, notes, or email) the Act node should
+execute and with what input.
+"""
 
 import re
 from typing import Any
@@ -7,6 +10,7 @@ from app.agent.prompts import PLAN_PROMPT_TEMPLATE
 from app.agent.state import AgentState
 from app.core.logger import get_logger
 from app.llm.groq_client import GroqClient
+from app.services.logging_service import LoggingService
 from app.utils.serialization import from_json
 
 logger = get_logger(__name__)
@@ -34,9 +38,9 @@ def _parse_plan(raw_response: str, fallback_message: str) -> list[str]:
     return [f"Respond to: {fallback_message}"]
 
 
-# -----------------------
+# ----------------------------------------------------------------------
 # Email routing
-# -----------------------
+# ----------------------------------------------------------------------
 
 _EMAIL_INTENT_PATTERN = re.compile(
     r"\b(email|mail|compose|send a message to)\b",
@@ -60,11 +64,9 @@ _EMAIL_BODY_CONNECTOR_PATTERN = re.compile(
 
 def _looks_like_email_request(text: str) -> bool:
     return (
-
         bool(_EMAIL_INTENT_PATTERN.search(text))
         and bool(_EMAIL_ADDRESS_PATTERN.search(text))
     )
-    
 
 
 def _extract_email_address(user_message: str) -> str | None:
@@ -99,6 +101,116 @@ def _extract_email_body(user_message: str) -> str:
     return remainder or user_message.strip()
 
 
+# ----------------------------------------------------------------------
+# Notes routing
+# ----------------------------------------------------------------------
+
+_NOTES_DELETE_PHRASES = (
+    "delete note",
+    "remove note",
+    "delete the note",
+    "remove the note",
+)
+
+_NOTES_UPDATE_PHRASES = (
+    "update note",
+    "edit note",
+    "update the note",
+    "edit the note",
+    "change note",
+)
+
+_NOTES_LIST_PHRASES = (
+    "show all my notes",
+    "show my notes",
+    "show notes",
+    "list notes",
+    "list my notes",
+    "what notes do i have",
+    "what are my notes",
+    "display notes",
+    "display my notes",
+)
+
+_NOTES_GET_PHRASES = (
+    "get note",
+    "find note",
+    "read note",
+    "show note",
+)
+
+_NOTES_CREATE_PHRASES = (
+    "save a note",
+    "save note",
+    "create a note",
+    "create note",
+    "remember this",
+    "remember that",
+    "take a note",
+    "note that",
+    "note down",
+    "make a note",
+)
+
+_NOTES_CREATE_STRIP_PHRASES = (
+    "save a note that",
+    "save a note",
+    "save note that",
+    "save note",
+    "create a note that",
+    "create a note",
+    "create note that",
+    "create note",
+    "remember that",
+    "remember this",
+    "take a note that",
+    "take a note",
+    "make a note that",
+    "make a note",
+    "note down that",
+    "note down",
+    "note that",
+)
+
+_UPDATE_CONNECTOR_PATTERN = re.compile(
+    r"^(to say|to|that|:|-)\s*",
+    re.IGNORECASE,
+)
+
+
+def _extract_note_id(text: str) -> int | None:
+    match = re.search(r"\d+", text)
+    return int(match.group()) if match else None
+
+
+def _extract_create_content(user_message: str) -> str:
+    lowered = user_message.strip().lower()
+
+    for phrase in _NOTES_CREATE_STRIP_PHRASES:
+        if lowered.startswith(phrase):
+            remainder = user_message.strip()[len(phrase):].strip(" :,-")
+
+            if remainder:
+                return remainder
+
+    return user_message.strip()
+
+
+def _extract_update_content(user_message: str) -> str | None:
+    match = re.search(r"\d+", user_message)
+
+    if not match:
+        return None
+
+    remainder = user_message[match.end():].strip()
+    remainder = _UPDATE_CONNECTOR_PATTERN.sub(
+        "",
+        remainder,
+    ).strip()
+
+    return remainder or None
+
+
 def _determine_tool_call(
     user_message: str,
     intent: str,
@@ -106,10 +218,6 @@ def _determine_tool_call(
     """Determine which tool should execute the request."""
 
     message = user_message.lower()
-
-    # -----------------------
-    # Email
-    # -----------------------
 
     if _looks_like_email_request(message):
         return (
@@ -120,51 +228,46 @@ def _determine_tool_call(
                     user_message,
                     intent,
                 ),
-                "body": _extract_email_body(
-                    user_message,
-                ),
+                "body": _extract_email_body(user_message),
             },
         )
 
-    # -----------------------
-    # Create note
-    # -----------------------
-    if any(
-        phrase in message
-        for phrase in (
-            "save a note",
-            "save note",
-            "remember",
-            "take a note",
-            "create note",
-            "create a note",
-            "note that",
+    if any(phrase in message for phrase in _NOTES_DELETE_PHRASES):
+        return (
+            "notes",
+            {
+                "action": "delete",
+                "note_id": _extract_note_id(message),
+            },
         )
-    ):
-        content = user_message
 
-        prefixes = [
-            "save a note that",
-            "save a note",
-            "save note",
-            "remember that",
-            "remember",
-            "save note that", 
-            "take a note that",
-            "take a note",
-            "create a note that",
-            "create a note",
-            "create note that",
-            "create note",
-            "note that",
-        ]
+    if any(phrase in message for phrase in _NOTES_UPDATE_PHRASES):
+        tool_input: dict[str, Any] = {
+            "action": "update",
+            "note_id": _extract_note_id(message),
+        }
 
-        lowered = message
+        content = _extract_update_content(user_message)
 
-        for prefix in prefixes:
-            if lowered.startswith(prefix):
-                content = user_message[len(prefix):].strip()
-                break
+        if content:
+            tool_input["content"] = content
+
+        return "notes", tool_input
+
+    if any(phrase in message for phrase in _NOTES_LIST_PHRASES):
+        return "notes", {"action": "list"}
+
+    if any(phrase in message for phrase in _NOTES_GET_PHRASES):
+        return (
+            "notes",
+            {
+                "action": "get",
+                "note_id": _extract_note_id(message),
+            },
+        )
+
+    if any(phrase in message for phrase in _NOTES_CREATE_PHRASES):
+        content = _extract_create_content(user_message)
 
         return (
             "notes",
@@ -175,84 +278,32 @@ def _determine_tool_call(
             },
         )
 
-    # -----------------------
-    # List notes
-    # -----------------------
-    if (
-        "show all my notes" in message
-        or "show my notes" in message
-        or "list my notes" in message
-        or "list notes" in message
-        or "all notes" in message
-    ):
-        return "notes", {"action": "list"}
-
-    # -----------------------
-    # Delete note
-    # -----------------------
-    match = re.search(r"delete note\s+(\d+)", message)
-    if match:
-        return (
-            "notes",
-            {
-                "action": "delete",
-                "note_id": int(match.group(1)),
-            },
-        )
-
-    # -----------------------
-    # Update note
-    # -----------------------
-    match = re.search(
-        r"update note\s+(\d+)\s+to\s+say\s+(.+)",
-        user_message,
-        re.IGNORECASE,
-    )
-    if match:
-        tool_input: dict[str, Any] = {
-            "action": "update",
-            "note_id": int(match.group(1)),
-        }
-
-        content = match.group(2).strip()
-
-        if content:
-            tool_input["content"] = content
-
-        return "notes", tool_input
-
-    # -----------------------
-    # Get note
-    # -----------------------
-    match = re.search(r"(?:show|get|read|find)\s+note\s+(\d+)", message)
-    if match:
-        return (
-            "notes",
-            {
-                "action": "get",
-                "note_id": int(match.group(1)),
-            },
-        )
-
-    # -----------------------
-    # Default: Search
-    # -----------------------
     return (
         "search",
         {
             "query": intent or user_message,
         },
     )
-
-
-def build_plan_node(llm_client: GroqClient):
+def build_plan_node(
+    llm_client: GroqClient,
+    logging_service: LoggingService | None = None,
+):
     """Create a Plan node bound to the provided LLM client."""
 
     def plan_node(state: AgentState) -> AgentState:
+        workflow_id = state["workflow_id"]
+
         logger.info(
             "Plan node started for workflow_id=%s",
-            state["workflow_id"],
+            workflow_id,
         )
+
+        if logging_service is not None:
+            logging_service.log_event(
+                message="Plan node started.",
+                level="INFO",
+                workflow_id=workflow_id,
+            )
 
         try:
             prompt = PLAN_PROMPT_TEMPLATE.format(
@@ -277,7 +328,7 @@ def build_plan_node(llm_client: GroqClient):
             state["tool_input"] = tool_input
             state["status"] = "COMPLETED"
 
-            # Let the graph continue to Act
+            # Continue to the Act node
             state["current_step"] = "ACT"
 
             state["metadata"] = {
@@ -287,14 +338,32 @@ def build_plan_node(llm_client: GroqClient):
             }
 
             logger.info(
-                "Plan node completed successfully with %d steps.",
+                "Plan node completed successfully with %d steps. Selected tool=%s",
                 len(plan),
+                tool_name,
             )
+
+            if logging_service is not None:
+                logging_service.log_event(
+                    message=(
+                        f"Plan node completed: generated {len(plan)} step(s); "
+                        f"selected tool '{tool_name}'."
+                    ),
+                    level="INFO",
+                    workflow_id=workflow_id,
+                )
 
             return state
 
         except Exception as exc:
             logger.exception("Plan node failed.")
+
+            if logging_service is not None:
+                logging_service.log_event(
+                    message=f"Plan node failed: {exc}",
+                    level="ERROR",
+                    workflow_id=workflow_id,
+                )
 
             state["status"] = "FAILED"
 
@@ -303,6 +372,7 @@ def build_plan_node(llm_client: GroqClient):
                 "plan_error": str(exc),
             }
 
+            # Re-raise so AgentService can finalize workflow as FAILED
             raise
 
     return plan_node

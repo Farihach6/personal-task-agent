@@ -22,7 +22,9 @@ from app.agent.state import create_initial_state
 from app.agent.tools.tool_executor import ToolExecutor
 from app.core.exceptions import GuardrailViolation
 from app.core.logger import get_logger
+from app.database.session import session_scope
 from app.llm.groq_client import GroqClient
+from app.services.logging_service import LoggingService
 from app.services.workflow_service import WorkflowService
 
 logger = get_logger(__name__)
@@ -39,14 +41,26 @@ class AgentService:
         llm_client: GroqClient | None = None,
         workflow_service: WorkflowService | None = None,
         tool_executor: ToolExecutor | None = None,
+        logging_service: LoggingService | None = None,
     ) -> None:
         # Resolved once and kept (rather than left to build_graph to resolve
         # internally) so resume() can reuse the exact same LLM client and
         # tool executor instances the original run used.
         self._llm_client = llm_client or GroqClient()
         self._tool_executor = tool_executor or ToolExecutor()
-        self._graph = build_graph(self._llm_client, self._tool_executor)
         self._workflow_service = workflow_service or WorkflowService()
+        self._logging_service = logging_service or LoggingService(
+            session_factory=getattr(
+                self._workflow_service,
+                "_session_factory",
+                session_scope,
+            )
+        )
+        self._graph = build_graph(
+            self._llm_client,
+            self._tool_executor,
+            self._logging_service,
+        )
 
     def run(self, user_message: str) -> dict[str, Any]:
         """Run the agent graph once and return the workflow_id, intent, plan,
@@ -63,6 +77,11 @@ class AgentService:
             workflow_id,
             len(user_message),
         )
+        self._logging_service.log_event(
+            f"Workflow started: {user_message[:200]!r}",
+            level="INFO",
+            workflow_id=workflow_id,
+        )
 
         initial_state = create_initial_state(workflow_id, user_message)
         final_state = initial_state
@@ -74,6 +93,11 @@ class AgentService:
                     final_state = node_state
 
             if final_state["status"] == "WAITING_APPROVAL":
+                self._logging_service.log_event(
+                    "Workflow paused: awaiting human approval.",
+                    level="WARNING",
+                    workflow_id=workflow_id,
+                )
                 self._workflow_service.mark_awaiting_approval(workflow_id)
             else:
                 self._workflow_service.finalize_workflow(
@@ -81,8 +105,17 @@ class AgentService:
                     status=final_state["status"],
                     final_response=final_state.get("final_response"),
                 )
-        except Exception:
+                self._log_workflow_finalized(
+                    workflow_id,
+                    final_state["status"],
+                )
+        except Exception as exc:
             logger.exception("Agent graph run failed: workflow_id=%s", workflow_id)
+            self._logging_service.log_event(
+                f"Workflow failed: unexpected error: {exc}",
+                level="ERROR",
+                workflow_id=workflow_id,
+            )
             self._workflow_service.finalize_workflow(workflow_id=workflow_id, status="FAILED")
             raise
 
@@ -113,11 +146,12 @@ class AgentService:
         completes the workflow gracefully without executing it if rejected.
         """
         context = self._workflow_service.get_workflow_context(workflow_id)
+        tool_name = context.get("tool_name")
         logger.info(
             "Resuming workflow_id=%s approved=%s tool=%s",
             workflow_id,
             approved,
-            context.get("tool_name"),
+            tool_name,
         )
 
         if context.get("status") != "WAITING_APPROVAL":
@@ -125,6 +159,12 @@ class AgentService:
                 f"Workflow {workflow_id} is not awaiting approval "
                 f"(current status: {context.get('status')!r}); it may have already been resolved."
             )
+
+        self._logging_service.log_event(
+            f"Human approval received: {'approved' if approved else 'rejected'} tool '{tool_name}'.",
+            level="INFO",
+            workflow_id=workflow_id,
+        )
 
         state = create_initial_state(workflow_id, context["user_message"])
         state["intent"] = context["intent"]
@@ -148,6 +188,11 @@ class AgentService:
             )
 
             if approved:
+                self._logging_service.log_event(
+                    f"Tool execution started: '{tool_name}'.",
+                    level="INFO",
+                    workflow_id=workflow_id,
+                )
                 try:
                     tool_result = self._tool_executor.execute(
                         context["tool_name"], context["tool_input"]
@@ -158,9 +203,19 @@ class AgentService:
                         **state["metadata"],
                         "act_tool_used": context["tool_name"],
                     }
+                    self._logging_service.log_event(
+                        f"Tool execution completed: '{tool_name}'.",
+                        level="INFO",
+                        workflow_id=workflow_id,
+                    )
                 except Exception as exc:  # noqa: BLE001 - a failed tool must not crash resume
                     logger.error(
                         "Resumed tool execution failed for workflow_id=%s: %s", workflow_id, exc
+                    )
+                    self._logging_service.log_event(
+                        f"Tool execution failed: '{tool_name}': {exc}",
+                        level="ERROR",
+                        workflow_id=workflow_id,
                     )
                     state["tool_result"] = None
                     state["status"] = "FAILED"
@@ -175,7 +230,10 @@ class AgentService:
 
             self._record_node_step(workflow_id, "act_node", context["user_message"], state)
 
-            observe_node = build_observe_node(self._llm_client)
+            observe_node = build_observe_node(
+                self._llm_client,
+                self._logging_service,
+            )
             state = observe_node(state)
             self._record_node_step(workflow_id, "observe_node", context["user_message"], state)
 
@@ -185,8 +243,17 @@ class AgentService:
                 final_response=state.get("final_response"),
                 approval_status=approval_status,
             )
+            self._log_workflow_finalized(
+                workflow_id,
+                state["status"],
+            )
         except Exception:
             logger.exception("Resume failed unexpectedly for workflow_id=%s", workflow_id)
+            self._logging_service.log_event(
+                "Workflow failed: unexpected error during resume.",
+                level="ERROR",
+                workflow_id=workflow_id,
+            )
             self._workflow_service.finalize_workflow(
                 workflow_id=workflow_id, status="FAILED", approval_status=approval_status
             )
@@ -201,6 +268,24 @@ class AgentService:
             "final_response": state.get("final_response") or "",
             "status": state["status"],
         }
+
+    def _log_workflow_finalized(
+        self,
+        workflow_id: str,
+        status: str,
+    ) -> None:
+        if status == "COMPLETED":
+            self._logging_service.log_event(
+                "Workflow completed successfully.",
+                level="INFO",
+                workflow_id=workflow_id,
+            )
+        elif status == "FAILED":
+            self._logging_service.log_event(
+                "Workflow failed.",
+                level="ERROR",
+                workflow_id=workflow_id,
+            )
 
     def _record_node_step(
         self, workflow_id: str, node_name: str, user_message: str, node_state: dict[str, Any]

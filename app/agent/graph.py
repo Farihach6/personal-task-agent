@@ -24,42 +24,66 @@ from app.agent.state import AgentState
 from app.agent.tools.tool_executor import ToolExecutor
 from app.core.logger import get_logger
 from app.llm.groq_client import GroqClient
+from app.services.logging_service import LoggingService
 
 logger = get_logger(__name__)
 
 
 def _route_after_act(state: AgentState) -> str:
     """Route to END if Act paused the workflow for approval; otherwise continue to Observe."""
-    if state.get("status") == "WAITING_APPROVAL":
+    if state["status"] == "WAITING_APPROVAL":
         return "paused"
     return "continue"
 
 
 def build_graph(
-    llm_client: GroqClient | None = None, tool_executor: ToolExecutor | None = None
+    llm_client: GroqClient | None = None,
+    tool_executor: ToolExecutor | None = None,
+    logging_service: LoggingService | None = None,
 ) -> CompiledStateGraph:
     """Compile the Reason -> Plan -> Act -> Observe graph.
 
-    Accepts an optional pre-built LLM client and tool executor so callers
-    (and tests) can inject fakes instead of always constructing real ones.
+    Accepts optional pre-built LLM client, tool executor, and logging service
+    so callers (and tests) can inject fakes instead of constructing real ones.
+
+    `logging_service` is threaded into every node. If omitted, execution logging
+    is simply disabled while all existing behavior remains unchanged.
     """
     client = llm_client or GroqClient()
     executor = tool_executor or ToolExecutor()
 
     graph = StateGraph(AgentState)
-    graph.add_node("reason_node", build_reason_node(client))
-    graph.add_node("plan_node", build_plan_node(client))
-    graph.add_node("act_node", build_act_node(executor))
-    graph.add_node("observe_node", build_observe_node(client))
+
+    graph.add_node(
+        "reason_node",
+        build_reason_node(client, logging_service),
+    )
+    graph.add_node(
+        "plan_node",
+        build_plan_node(client, logging_service),
+    )
+    graph.add_node(
+        "act_node",
+        build_act_node(executor, logging_service),
+    )
+    graph.add_node(
+        "observe_node",
+        build_observe_node(client, logging_service),
+    )
 
     graph.add_edge(START, "reason_node")
     graph.add_edge("reason_node", "plan_node")
     graph.add_edge("plan_node", "act_node")
+
     graph.add_conditional_edges(
         "act_node",
         _route_after_act,
-        {"paused": END, "continue": "observe_node"},
+        {
+            "paused": END,
+            "continue": "observe_node",
+        },
     )
+
     graph.add_edge("observe_node", END)
 
     return graph.compile()

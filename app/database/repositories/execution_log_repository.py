@@ -32,11 +32,38 @@ class ExecutionLogRepository(BaseRepository[ExecutionLog]):
         limit: int = DEFAULT_LIMIT,
         level: str | None = None,
     ) -> list[ExecutionLog]:
-        """Return recent log entries, optionally filtered by level."""
+        """Return recent log entries, newest first, optionally filtered by level."""
 
         limit = max(1, min(limit, self.MAX_LIMIT))
 
         stmt = select(ExecutionLog)
+
+        if level:
+            stmt = stmt.where(ExecutionLog.level == level.upper())
+
+        stmt = (
+            stmt
+            .order_by(ExecutionLog.created_at.desc())
+            .limit(limit)
+        )
+
+        return list(self.db.execute(stmt).scalars().all())
+
+    def search(
+        self,
+        workflow_id: str | None = None,
+        level: str | None = None,
+        limit: int = DEFAULT_LIMIT,
+    ) -> list[ExecutionLog]:
+        """Return log entries newest first, optionally filtered by
+        workflow ID and/or level."""
+
+        limit = max(1, min(limit, self.MAX_LIMIT))
+
+        stmt = select(ExecutionLog)
+
+        if workflow_id:
+            stmt = stmt.where(ExecutionLog.workflow_id == workflow_id)
 
         if level:
             stmt = stmt.where(ExecutionLog.level == level.upper())

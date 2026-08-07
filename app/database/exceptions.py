@@ -6,6 +6,9 @@ from app.core.exceptions import AppException
 class DatabaseOperationError(AppException):
     """Raised when a database operation fails."""
 
+    status_code = 500
+    error_code = "database_operation_error"
+
     def __init__(self, message: str = "Database operation failed") -> None:
         super().__init__(message)
 
@@ -23,5 +26,11 @@ class RecordNotFoundError(DatabaseOperationError):
 class IntegrityConstraintError(DatabaseOperationError):
     """Raised when a database integrity constraint is violated."""
 
-    def __init__(self, message: str = "Database integrity constraint violated") -> None:
+    status_code = 409
+    error_code = "integrity_constraint_error"
+
+    def __init__(
+        self,
+        message: str = "Database integrity constraint violated",
+    ) -> None:
         super().__init__(message)

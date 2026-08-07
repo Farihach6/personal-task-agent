@@ -5,20 +5,25 @@ from typing import Any
 from app.agent.state import AgentState
 from app.agent.tools.tool_executor import ToolExecutor
 from app.core.logger import get_logger
+from app.services.logging_service import LoggingService
 
 logger = get_logger(__name__)
 
 
-def build_act_node(tool_executor: ToolExecutor):
+def build_act_node(
+    tool_executor: ToolExecutor,
+    logging_service: LoggingService | None = None,
+):
     """Create an Act node bound to the provided ToolExecutor."""
 
     def act_node(state: AgentState) -> AgentState:
+        workflow_id = state["workflow_id"]
+
         logger.info(
             "Act node started for workflow_id=%s",
-            state["workflow_id"],
+            workflow_id,
         )
 
-        # Use the tool selected by the Plan node.
         tool_name = state.get("tool_name") or "search"
 
         tool_input: dict[str, Any] = (
@@ -28,7 +33,6 @@ def build_act_node(tool_executor: ToolExecutor):
             }
         )
 
-        # Always record tool information.
         state["tool_name"] = tool_name
         state["tool_input"] = tool_input
 
@@ -50,13 +54,29 @@ def build_act_node(tool_executor: ToolExecutor):
                     "act_tool_used": tool_name,
                 }
 
+                if logging_service is not None:
+                    logging_service.log_event(
+                        message=(
+                            f"Human approval requested: tool '{tool_name}' "
+                            "requires approval before it can run."
+                        ),
+                        level="WARNING",
+                        workflow_id=workflow_id,
+                    )
+
                 return state
+
+            if logging_service is not None:
+                logging_service.log_event(
+                    message=f"Tool execution started: '{tool_name}'.",
+                    level="INFO",
+                    workflow_id=workflow_id,
+                )
 
             tool_result = tool_executor.execute(
                 tool_name=tool_name,
                 tool_input=tool_input,
             )
-
             state["tool_result"] = tool_result
             state["status"] = "RUNNING"
             state["current_step"] = "OBSERVE"
@@ -71,8 +91,22 @@ def build_act_node(tool_executor: ToolExecutor):
                 tool_name,
             )
 
+            if logging_service is not None:
+                logging_service.log_event(
+                    message=f"Tool execution completed: '{tool_name}'.",
+                    level="INFO",
+                    workflow_id=workflow_id,
+                )
+
         except Exception as exc:
             logger.exception("Act node failed.")
+
+            if logging_service is not None:
+                logging_service.log_event(
+                    message=f"Tool execution failed: '{tool_name}': {exc}",
+                    level="ERROR",
+                    workflow_id=workflow_id,
+                )
 
             state["tool_result"] = None
             state["status"] = "FAILED"
@@ -81,6 +115,7 @@ def build_act_node(tool_executor: ToolExecutor):
             state["metadata"] = {
                 **state["metadata"],
                 "error": str(exc),
+                "act_tool_used": tool_name,
             }
 
         return state

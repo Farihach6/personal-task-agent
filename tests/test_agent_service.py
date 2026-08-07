@@ -11,6 +11,7 @@ from app.agent.tools.tool_executor import ToolExecutor
 from app.core.exceptions import GuardrailViolation, ToolExecutionError
 from app.database.repositories import NoteRepository, WorkflowStepRepository
 from app.services.agent_service import AgentService
+from app.services.logging_service import LoggingService
 from app.services.workflow_service import WorkflowService
 
 
@@ -36,6 +37,11 @@ class _FakeWorkflowService:
         self.finalized: list[dict] = []
         self.awaiting_approval: list[str] = []
         self._next_id = 1
+        # AgentService derives its default LoggingService's session_factory
+        # from this attribute when present; setting it to None (rather than
+        # omitting it) makes that derivation safely no-op instead of
+        # silently falling back to the real database engine.
+        self._session_factory = None
 
     def create_workflow(self, user_prompt: str) -> str:
         self.created_prompts.append(user_prompt)
@@ -246,7 +252,7 @@ class _FakeEmailService:
 
     def send_email(self, to: str, subject: str, body: str) -> dict:
         self.calls.append({"to": to, "subject": subject, "body": body})
-        return {"sent": True, "simulated": False, "to": to, "subject": subject,"body": body}
+        return {"sent": True, "simulated": False, "to": to, "subject": subject,"body": body,}
 
 
 def test_agent_service_resume_approves_and_sends_the_email(workflow_session_factory, db_session):
@@ -385,3 +391,118 @@ def test_agent_service_resume_rejects_when_workflow_is_not_awaiting_approval(
 
     with pytest.raises(GuardrailViolation):
         service.resume(result["workflow_id"], approved=True)
+
+
+def test_agent_service_run_writes_execution_logs_for_every_node(
+    workflow_session_factory, db_session
+):
+    """The graph must automatically write execution_logs entries for the
+    workflow lifecycle and every node, without any extra wiring by the caller."""
+    from app.database.repositories import ExecutionLogRepository
+
+    llm = _FakeLLMClient(["Find restaurants", '["Search restaurants"]', "Here are some options."])
+    workflow_service = WorkflowService(session_factory=workflow_session_factory)
+    logging_service = LoggingService(session_factory=workflow_session_factory)
+    tool_executor = ToolExecutor(tools=[SearchTool()])
+    service = AgentService(
+        llm_client=llm,
+        workflow_service=workflow_service,
+        tool_executor=tool_executor,
+        logging_service=logging_service,
+    )
+
+    result = service.run("Find me a good restaurant")
+
+    logs = ExecutionLogRepository(db_session).get_by_workflow(result["workflow_id"])
+    messages = [log.message for log in logs]
+
+    assert any("Workflow started" in m for m in messages)
+    assert any("Reason node completed" in m for m in messages)
+    assert any("Plan node completed" in m for m in messages)
+    assert any("Tool execution started" in m for m in messages)
+    assert any("Tool execution completed" in m for m in messages)
+    assert any("Observe node completed" in m for m in messages)
+    assert any("Workflow completed" in m for m in messages)
+    # All entries must carry the workflow_id and a timestamp.
+    assert all(log.workflow_id == result["workflow_id"] for log in logs)
+    assert all(log.created_at is not None for log in logs)
+
+
+def test_agent_service_run_writes_error_level_log_on_tool_failure(
+    workflow_session_factory, db_session
+):
+    """A tool failure must be logged at ERROR level with the workflow failure too."""
+    from app.database.repositories import ExecutionLogRepository
+
+    class _FailingToolExecutor:
+        def execute(self, tool_name, tool_input):
+            raise ToolExecutionError("search backend down")
+
+        def requires_approval(self, tool_name):
+            return False
+
+    llm = _FakeLLMClient(["intent", "[]"])
+    workflow_service = WorkflowService(session_factory=workflow_session_factory)
+    logging_service = LoggingService(session_factory=workflow_session_factory)
+    service = AgentService(
+        llm_client=llm,
+        workflow_service=workflow_service,
+        tool_executor=_FailingToolExecutor(),
+        logging_service=logging_service,
+    )
+
+    result = service.run("Hello")
+    assert result["status"] == "FAILED"
+
+    logs = ExecutionLogRepository(db_session).get_by_workflow(result["workflow_id"])
+    error_logs = [log for log in logs if log.level == "ERROR"]
+
+    assert any("Tool execution failed" in log.message for log in error_logs)
+    assert any("Workflow failed" in log.message for log in error_logs)
+
+
+def test_agent_service_pause_and_resume_writes_approval_logs(
+    workflow_session_factory, db_session
+):
+    """The full email pause -> approve lifecycle must log 'Human approval
+    requested' (WARNING) and 'Human approval received' (INFO) alongside the
+    tool start/completed and workflow completed events."""
+    from app.database.repositories import ExecutionLogRepository
+
+    class _FakeEmailService:
+        def send_email(self, to, subject, body):
+            return {"sent": True, "simulated": False, "to": to, "subject": subject,"body": body,}
+
+    workflow_service = WorkflowService(session_factory=workflow_session_factory)
+    logging_service = LoggingService(session_factory=workflow_session_factory)
+    tool_executor = ToolExecutor(
+        tools=[SearchTool(), EmailTool(email_service=_FakeEmailService())]
+    )
+
+    pause_llm = _FakeLLMClient(["Send an email", '["Send the email"]'])
+    service = AgentService(
+        llm_client=pause_llm,
+        workflow_service=workflow_service,
+        tool_executor=tool_executor,
+        logging_service=logging_service,
+    )
+    paused = service.run("Send an email to john@example.com saying hi")
+    assert paused["status"] == "WAITING_APPROVAL"
+
+    resume_llm = _FakeLLMClient(["I've sent your email."])
+    resume_service = AgentService(
+        llm_client=resume_llm,
+        workflow_service=workflow_service,
+        tool_executor=tool_executor,
+        logging_service=logging_service,
+    )
+    result = resume_service.resume(paused["workflow_id"], approved=True)
+    assert result["status"] == "COMPLETED"
+
+    logs = ExecutionLogRepository(db_session).get_by_workflow(paused["workflow_id"])
+    messages_by_level = {(log.message, log.level) for log in logs}
+
+    assert any("Human approval requested" in m and lvl == "WARNING" for m, lvl in messages_by_level)
+    assert any("Human approval received" in m and lvl == "INFO" for m, lvl in messages_by_level)
+    assert any("Workflow paused" in m for m, _ in messages_by_level)
+    assert any("Workflow completed" in m for m, _ in messages_by_level)
