@@ -1,7 +1,7 @@
 /**
  * Single wrapper around fetch() for all backend calls.
  * Centralizing this avoids duplicated base-URL / error-handling logic
- * across chat.js, history.js, notes.js, approvals.js, and logs.js.
+ * across chat.js, history.js, notes.js, and logs.js.
  */
 const Api = (() => {
   const BASE_URL = "/api/v1";
@@ -35,5 +35,13 @@ const Api = (() => {
     listPendingApprovals: () => request("/approvals"),
     approveWorkflow: (workflowId) => request(`/approvals/${workflowId}/approve`, { method: "POST" }),
     rejectWorkflow: (workflowId) => request(`/approvals/${workflowId}/reject`, { method: "POST" }),
+    listWorkflows: (params = {}) => {
+      const query = new URLSearchParams(
+        Object.fromEntries(Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== ""))
+      ).toString();
+      return request(`/workflows${query ? `?${query}` : ""}`);
+    },
+    getWorkflow: (workflowId) => request(`/workflows/${workflowId}`),
+    getWorkflowSteps: (workflowId) => request(`/workflows/${workflowId}/steps`),
   };
 })();

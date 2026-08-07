@@ -43,13 +43,27 @@ class _FakeWorkflowService:
         self._next_id += 1
         return workflow_id
 
-    def record_step(self, workflow_id, node_type, input_data, output_data) -> None:
+    def record_step(self, workflow_id, node_type, input_data, output_data, tool_name=None) -> None:
         self.recorded_steps.append(
             {
                 "workflow_id": workflow_id,
                 "node_type": node_type,
                 "input_data": input_data,
                 "output_data": output_data,
+                "tool_name": tool_name,
+            }
+        )
+
+    def save_step(
+        self, workflow_id, node_name, action_summary, tool_name=None, tool_input=None, tool_output=None
+    ) -> None:
+        self.recorded_steps.append(
+            {
+                "workflow_id": workflow_id,
+                "node_type": node_name.upper(),
+                "input_data": {"tool_name": tool_name, "tool_input": tool_input},
+                "output_data": {"action_summary": action_summary, "tool_output": tool_output},
+                "tool_name": tool_name,
             }
         )
 
@@ -232,7 +246,7 @@ class _FakeEmailService:
 
     def send_email(self, to: str, subject: str, body: str) -> dict:
         self.calls.append({"to": to, "subject": subject, "body": body})
-        return {"sent": True, "simulated": False, "to": to, "subject": subject,"body": body,  }
+        return {"sent": True, "simulated": False, "to": to, "subject": subject,"body": body}
 
 
 def test_agent_service_resume_approves_and_sends_the_email(workflow_session_factory, db_session):
@@ -264,7 +278,7 @@ def test_agent_service_resume_approves_and_sends_the_email(workflow_session_fact
     ]
 
     steps = WorkflowStepRepository(db_session).get_by_workflow(paused["workflow_id"])
-    assert [s.node_type for s in steps] == ["REASON", "PLAN", "ACT", "ACT", "OBSERVE"]
+    assert [s.node_type for s in steps] == ["REASON", "PLAN", "ACT", "APPROVAL", "ACT", "OBSERVE"]
 
 
 def test_agent_service_resume_rejects_and_never_sends_the_email(workflow_session_factory, db_session):
@@ -317,36 +331,57 @@ def test_agent_service_pending_approvals_list_clears_after_resume(
     )
     resume_service.resume(paused["workflow_id"], approved=True)
 
-    # Ensures the workflow is removed from the pending list once resumed.
     assert workflow_service.get_pending_approvals() == []
 
 
-def test_agent_service_resume_rejects_already_completed_workflow():
-    """Idempotency guard (Fix #1): resuming/approving a workflow that has
-    already been finalized (status != WAITING_APPROVAL) must raise
-    GuardrailViolation instead of re-executing the tool a second time."""
-    workflow_service = _FakeWorkflowService()
-    workflow_service._context = {
-        "user_message": "Send an email",
-        "status": "COMPLETED",
-        "approval_status": "APPROVED",
-        "intent": "Send an email",
-        "plan": ["Send the email"],
-        "tool_name": "email",
-        "tool_input": {
-            "to": "john@example.com",
-            "subject": "Hi",
-            "body": "Hello",
-        },
-    }
-
-    service = AgentService(
-        llm_client=_FakeLLMClient([]),
-        workflow_service=workflow_service,
-        tool_executor=ToolExecutor(
-            tools=[SearchTool(), EmailTool(email_service=_FakeEmailService())]
-        ),
+def test_agent_service_resume_is_idempotent_and_does_not_resend_on_second_approval(
+    workflow_session_factory, db_session
+):
+    """Regression: calling resume() twice on the same workflow must not
+    execute the sensitive tool (e.g. send the email) a second time."""
+    workflow_service = WorkflowService(session_factory=workflow_session_factory)
+    fake_email_service = _FakeEmailService()
+    tool_executor = ToolExecutor(
+        tools=[SearchTool(), EmailTool(email_service=fake_email_service)]
     )
 
+    pause_llm = _FakeLLMClient(["Send an email", '["Send the email"]'])
+    service = AgentService(
+        llm_client=pause_llm, workflow_service=workflow_service, tool_executor=tool_executor
+    )
+    paused = service.run("Send an email to john@example.com saying hi")
+
+    first_llm = _FakeLLMClient(["Sent once."])
+    first_resume_service = AgentService(
+        llm_client=first_llm, workflow_service=workflow_service, tool_executor=tool_executor
+    )
+    first_result = first_resume_service.resume(paused["workflow_id"], approved=True)
+    assert first_result["status"] == "COMPLETED"
+    assert len(fake_email_service.calls) == 1
+
+    second_llm = _FakeLLMClient(["Sent again?!"])
+    second_resume_service = AgentService(
+        llm_client=second_llm, workflow_service=workflow_service, tool_executor=tool_executor
+    )
     with pytest.raises(GuardrailViolation):
-        service.resume("fake-wf-1", approved=True)
+        second_resume_service.resume(paused["workflow_id"], approved=True)
+
+    # The email must still only have been sent once.
+    assert len(fake_email_service.calls) == 1
+
+
+def test_agent_service_resume_rejects_when_workflow_is_not_awaiting_approval(
+    workflow_session_factory, db_session
+):
+    """Regression: resume() must refuse to act on a workflow that was never
+    paused (e.g. a normal already-COMPLETED search workflow)."""
+    workflow_service = WorkflowService(session_factory=workflow_session_factory)
+    tool_executor = ToolExecutor(tools=[SearchTool()])
+
+    llm = _FakeLLMClient(["Find restaurants", '["Search restaurants"]', "Here are some options."])
+    service = AgentService(llm_client=llm, workflow_service=workflow_service, tool_executor=tool_executor)
+    result = service.run("Find me a good restaurant")
+    assert result["status"] == "COMPLETED"
+
+    with pytest.raises(GuardrailViolation):
+        service.resume(result["workflow_id"], approved=True)

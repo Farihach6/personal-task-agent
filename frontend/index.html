@@ -26,7 +26,29 @@
       </section>
 
       <section id="tab-history" class="tab-panel">
-        <p class="placeholder">Workflow history dashboard will be implemented in a later milestone.</p>
+        <div class="history-toolbar">
+          <p class="approvals-hint">Every agent run is recorded here — click a row to see its full step-by-step trace.</p>
+          <button id="history-refresh-btn" class="btn btn-secondary">Refresh</button>
+        </div>
+
+        <div id="history-state" class="notes-state"></div>
+
+        <div class="history-table-wrapper">
+          <table id="history-table" class="history-table">
+            <thead>
+              <tr>
+                <th>Workflow</th>
+                <th>Request</th>
+                <th>Status</th>
+                <th>Started</th>
+                <th>Duration</th>
+              </tr>
+            </thead>
+            <tbody id="history-table-body"></tbody>
+          </table>
+        </div>
+
+        <div id="history-pagination" class="pagination"></div>
       </section>
 
       <section id="tab-notes" class="tab-panel">
@@ -72,6 +94,18 @@
         <button id="note-cancel-btn" class="btn btn-secondary">Cancel</button>
         <button id="note-save-btn" class="btn btn-primary">Save</button>
       </div>
+    </div>
+  </div>
+
+  <div id="history-detail-overlay" class="modal-overlay hidden">
+    <div class="modal card history-detail-modal">
+      <div class="history-detail-header">
+        <h3>Workflow Detail</h3>
+        <button id="history-detail-close-btn" class="btn btn-secondary">Close</button>
+      </div>
+      <div id="history-detail-meta" class="history-detail-meta"></div>
+      <div id="history-detail-state" class="notes-state"></div>
+      <div id="history-timeline" class="history-timeline"></div>
     </div>
   </div>
 

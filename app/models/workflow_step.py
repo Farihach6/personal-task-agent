@@ -14,7 +14,7 @@ class WorkflowStep(Base):
     __tablename__ = "workflow_steps"
     __table_args__ = (
         CheckConstraint(
-            "node_type IN ('REASON','PLAN','ACT','OBSERVE')",
+            "node_type IN ('REASON','PLAN','ACT','OBSERVE','APPROVAL')",
             name="ck_workflow_steps_node_type",
         ),
         Index(
@@ -28,7 +28,7 @@ class WorkflowStep(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     workflow_id: Mapped[str] = mapped_column(String(36), ForeignKey("workflows.id"), nullable=False)
     step_number: Mapped[int] = mapped_column(Integer, nullable=False)
-    node_type: Mapped[str] = mapped_column(String(16), nullable=False)  # REASON, PLAN, ACT, OBSERVE
+    node_type: Mapped[str] = mapped_column(String(16), nullable=False)  # REASON, PLAN, ACT, OBSERVE, APPROVAL
     tool_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     input_data: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON-encoded
     output_data: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON-encoded

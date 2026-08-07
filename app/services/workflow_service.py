@@ -53,6 +53,7 @@ class WorkflowService:
         node_type: str,
         input_data: dict[str, Any],
         output_data: dict[str, Any],
+        tool_name: str | None = None,
     ) -> None:
         """Append a workflow_steps row for one node execution."""
         with self._session_factory() as db:
@@ -62,6 +63,7 @@ class WorkflowService:
                 workflow_id=workflow_id,
                 step_number=step_number,
                 node_type=node_type,
+                tool_name=tool_name,
                 input_data=to_json(input_data),
                 output_data=to_json(output_data),
             )
@@ -176,3 +178,131 @@ class WorkflowService:
                     context["tool_input"] = input_data.get("tool_input")
 
             return context
+
+    # --- Milestone 9: workflow history persistence & retrieval ---
+    #
+    # complete_workflow()/fail_workflow() are thin, explicitly-named
+    # wrappers around the existing finalize_workflow() — kept as separate
+    # methods (rather than replacing finalize_workflow, which AgentService
+    # already depends on) so both the original and the newly-requested
+    # public interface work side by side without changing prior behavior.
+
+    def complete_workflow(self, workflow_id: str, final_response: str | None = None) -> None:
+        """Mark a workflow as successfully COMPLETED."""
+        self.finalize_workflow(workflow_id, status="COMPLETED", final_response=final_response)
+
+    def fail_workflow(self, workflow_id: str, final_response: str | None = None) -> None:
+        """Mark a workflow as FAILED."""
+        self.finalize_workflow(workflow_id, status="FAILED", final_response=final_response)
+
+    def save_step(
+        self,
+        workflow_id: str,
+        node_name: str,
+        action_summary: str,
+        tool_name: str | None = None,
+        tool_input: dict[str, Any] | None = None,
+        tool_output: dict[str, Any] | None = None,
+    ) -> None:
+        """Append a workflow_steps row with an explicit action_summary and
+        tool input/output — a convenience entry point alongside record_step()
+        for callers (e.g. the approval decision itself) that want this exact
+        shape rather than record_step()'s more free-form input/output dicts.
+        """
+        self.record_step(
+            workflow_id=workflow_id,
+            node_type=node_name.upper(),
+            input_data={"tool_name": tool_name, "tool_input": tool_input},
+            output_data={"action_summary": action_summary, "tool_output": tool_output},
+            tool_name=tool_name,
+        )
+
+    def get_workflows(self, limit: int = 50, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
+        """Return a page of workflows (newest first) plus the total count."""
+        with self._session_factory() as db:
+            repo = WorkflowRepository(db)
+            workflows = repo.get_recent(limit=limit, offset=offset)
+            total = repo.count()
+            items = [self._workflow_to_dict(wf) for wf in workflows]
+            return items, total
+
+    def get_workflow(self, workflow_id: str) -> dict[str, Any]:
+        """Return a single workflow's metadata as a plain dict.
+
+        Raises:
+            RecordNotFoundError: if no workflow with this id exists.
+        """
+        with self._session_factory() as db:
+            workflow = WorkflowRepository(db).get_by_id(workflow_id)
+            return self._workflow_to_dict(workflow)
+
+    def get_workflow_steps(self, workflow_id: str) -> list[dict[str, Any]]:
+        """Return every step of a workflow, in chronological order, as plain dicts."""
+        with self._session_factory() as db:
+            steps = WorkflowStepRepository(db).get_by_workflow(workflow_id)
+            return [self._step_to_dict(step) for step in steps]
+
+    @staticmethod
+    def _workflow_to_dict(workflow: Any) -> dict[str, Any]:
+        """Convert a Workflow ORM row to a plain dict while its session is
+        still open (attributes become unsafe to access once the enclosing
+        `with self._session_factory()` block exits)."""
+        return {
+            "workflow_id": workflow.id,
+            "user_input": workflow.user_prompt,
+            "final_response": workflow.final_response,
+            "status": workflow.status,
+            "started_at": workflow.started_at,
+            "finished_at": workflow.completed_at,
+        }
+
+    @staticmethod
+    def _step_to_dict(step: Any) -> dict[str, Any]:
+        """Convert a WorkflowStep ORM row to a plain dict, normalizing the
+        two shapes that end up in input_data/output_data: the original
+        per-node shape written by record_step() (Milestones 5-8) and the
+        explicit action_summary/tool_output shape written by save_step()
+        (Milestone 9's APPROVAL steps) — so API consumers see one
+        consistent shape regardless of which method wrote the row.
+        """
+        input_data = from_json(step.input_data, default={})
+        output_data = from_json(step.output_data, default={})
+
+        if step.node_type == "REASON":
+            action_summary = f"Identified intent: {output_data.get('intent', '')}".strip()
+            tool_name, tool_input, tool_output = None, None, None
+        elif step.node_type == "PLAN":
+            plan = output_data.get("plan", [])
+            action_summary = f"Generated a {len(plan)}-step plan."
+            tool_name, tool_input, tool_output = None, None, None
+        elif step.node_type == "ACT":
+            tool_name = step.tool_name or input_data.get("tool_name")
+            tool_input = input_data.get("tool_input")
+            tool_output = output_data.get("tool_result")
+            action_summary = (
+                f"Paused for approval before running tool '{tool_name}'."
+                if output_data.get("status") == "WAITING_APPROVAL"
+                else f"Executed tool '{tool_name}'."
+            )
+        elif step.node_type == "OBSERVE":
+            action_summary = "Generated the final response."
+            tool_name, tool_input, tool_output = None, None, None
+        elif step.node_type == "APPROVAL":
+            action_summary = output_data.get("action_summary", "")
+            tool_name = step.tool_name or input_data.get("tool_name")
+            tool_input = input_data.get("tool_input")
+            tool_output = output_data.get("tool_output")
+        else:
+            action_summary = ""
+            tool_name, tool_input, tool_output = step.tool_name, None, None
+
+        return {
+            "workflow_id": step.workflow_id,
+            "sequence_number": step.step_number,
+            "node_name": step.node_type,
+            "action_summary": action_summary,
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+            "tool_output": tool_output,
+            "timestamp": step.created_at,
+        }

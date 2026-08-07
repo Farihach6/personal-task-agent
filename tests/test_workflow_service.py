@@ -1,6 +1,8 @@
 """Tests for WorkflowService, bound to the isolated in-memory test database
 via the workflow_session_factory fixture rather than the real engine."""
 
+import pytest
+
 from app.database.repositories import WorkflowRepository, WorkflowStepRepository
 from app.services.workflow_service import WorkflowService
 
@@ -178,3 +180,173 @@ def test_get_workflow_context_returns_safe_defaults_when_no_steps_recorded(
     assert context["plan"] == []
     assert context["tool_name"] is None
     assert context["tool_input"] is None
+
+
+def test_complete_workflow_sets_completed_status_and_response(workflow_session_factory, db_session):
+    service = WorkflowService(session_factory=workflow_session_factory)
+    workflow_id = service.create_workflow("Find a restaurant")
+
+    service.complete_workflow(workflow_id, final_response="Here are some options.")
+
+    workflow = WorkflowRepository(db_session).get_by_id(workflow_id)
+    assert workflow.status == "COMPLETED"
+    assert workflow.final_response == "Here are some options."
+    assert workflow.completed_at is not None
+
+
+def test_fail_workflow_sets_failed_status(workflow_session_factory, db_session):
+    service = WorkflowService(session_factory=workflow_session_factory)
+    workflow_id = service.create_workflow("Find a restaurant")
+
+    service.fail_workflow(workflow_id, final_response="Something went wrong.")
+
+    workflow = WorkflowRepository(db_session).get_by_id(workflow_id)
+    assert workflow.status == "FAILED"
+    assert workflow.final_response == "Something went wrong."
+
+
+def test_save_step_persists_action_summary_and_tool_details(workflow_session_factory, db_session):
+    service = WorkflowService(session_factory=workflow_session_factory)
+    workflow_id = service.create_workflow("Send an email")
+
+    service.save_step(
+        workflow_id=workflow_id,
+        node_name="approval",
+        action_summary="Human approved running tool 'email'.",
+        tool_name="email",
+        tool_input={"to": "john@example.com", "body": "hi"},
+        tool_output=None,
+    )
+
+    steps = WorkflowStepRepository(db_session).get_by_workflow(workflow_id)
+    assert len(steps) == 1
+    assert steps[0].node_type == "APPROVAL"
+    assert steps[0].tool_name == "email"
+
+
+def test_save_step_defaults_node_name_case_insensitively(workflow_session_factory, db_session):
+    service = WorkflowService(session_factory=workflow_session_factory)
+    workflow_id = service.create_workflow("Hello")
+
+    service.save_step(workflow_id=workflow_id, node_name="approval", action_summary="Approved.")
+
+    steps = WorkflowStepRepository(db_session).get_by_workflow(workflow_id)
+    assert steps[0].node_type == "APPROVAL"
+
+
+def test_get_workflows_returns_newest_first_with_total(workflow_session_factory):
+    service = WorkflowService(session_factory=workflow_session_factory)
+    first_id = service.create_workflow("First request")
+    second_id = service.create_workflow("Second request")
+    service.complete_workflow(second_id, final_response="Done second.")
+    service.complete_workflow(first_id, final_response="Done first.")
+
+    items, total = service.get_workflows(limit=10, offset=0)
+
+    assert total == 2
+    # Newest first: second_id was created after first_id, so it has the
+    # later started_at and must appear first regardless of completion order.
+    assert [item["workflow_id"] for item in items] == [second_id, first_id]
+    assert items[0]["user_input"] == "Second request"
+    assert items[0]["final_response"] == "Done second."
+    assert items[0]["status"] == "COMPLETED"
+
+
+def test_get_workflows_respects_limit_and_offset(workflow_session_factory):
+    service = WorkflowService(session_factory=workflow_session_factory)
+    for i in range(5):
+        service.create_workflow(f"Request {i}")
+
+    page_one, total = service.get_workflows(limit=2, offset=0)
+    page_two, _ = service.get_workflows(limit=2, offset=2)
+
+    assert total == 5
+    assert len(page_one) == 2
+    assert len(page_two) == 2
+    assert page_one[0]["workflow_id"] != page_two[0]["workflow_id"]
+
+
+def test_get_workflow_returns_metadata_dict(workflow_session_factory):
+    service = WorkflowService(session_factory=workflow_session_factory)
+    workflow_id = service.create_workflow("Find a restaurant")
+    service.complete_workflow(workflow_id, final_response="Here you go.")
+
+    item = service.get_workflow(workflow_id)
+
+    assert item["workflow_id"] == workflow_id
+    assert item["user_input"] == "Find a restaurant"
+    assert item["final_response"] == "Here you go."
+    assert item["status"] == "COMPLETED"
+    assert item["started_at"] is not None
+    assert item["finished_at"] is not None
+
+
+def test_get_workflow_raises_for_unknown_id(workflow_session_factory):
+    from app.database.exceptions import RecordNotFoundError
+
+    service = WorkflowService(session_factory=workflow_session_factory)
+    with pytest.raises(RecordNotFoundError):
+        service.get_workflow("nonexistent-id")
+
+
+def test_get_workflow_steps_returns_chronological_normalized_steps(
+    workflow_session_factory,
+):
+    service = WorkflowService(session_factory=workflow_session_factory)
+    workflow_id = service.create_workflow("Send an email to john@example.com saying hi")
+
+    service.record_step(
+        workflow_id, "REASON", {"user_message": "Send an email"}, {"intent": "Send an email"}
+    )
+    service.record_step(
+        workflow_id, "PLAN", {"intent": "Send an email"}, {"plan": ["Send the email"]}
+    )
+    service.record_step(
+        workflow_id,
+        "ACT",
+        {"tool_name": "email", "tool_input": {"to": "john@example.com"}},
+        {"tool_result": None, "status": "WAITING_APPROVAL"},
+        tool_name="email",
+    )
+    service.save_step(
+        workflow_id=workflow_id,
+        node_name="approval",
+        action_summary="Human approved running tool 'email'.",
+        tool_name="email",
+        tool_input={"to": "john@example.com"},
+    )
+    service.record_step(
+        workflow_id,
+        "ACT",
+        {"tool_name": "email", "tool_input": {"to": "john@example.com"}},
+        {"tool_result": {"sent": True}, "status": "RUNNING"},
+        tool_name="email",
+    )
+    service.record_step(
+        workflow_id,
+        "OBSERVE",
+        {"tool_result": {"sent": True}},
+        {"final_response": "Sent!", "status": "COMPLETED"},
+    )
+
+    steps = service.get_workflow_steps(workflow_id)
+
+    assert [s["node_name"] for s in steps] == ["REASON", "PLAN", "ACT", "APPROVAL", "ACT", "OBSERVE"]
+    assert [s["sequence_number"] for s in steps] == [1, 2, 3, 4, 5, 6]
+    assert steps[0]["action_summary"] == "Identified intent: Send an email"
+    assert steps[1]["action_summary"] == "Generated a 1-step plan."
+    assert steps[2]["action_summary"] == "Paused for approval before running tool 'email'."
+    assert steps[3]["action_summary"] == "Human approved running tool 'email'."
+    assert steps[3]["tool_name"] == "email"
+    assert steps[4]["action_summary"] == "Executed tool 'email'."
+    assert steps[4]["tool_output"] == {"sent": True}
+    assert steps[5]["action_summary"] == "Generated the final response."
+
+
+def test_get_workflow_steps_returns_empty_list_for_workflow_with_no_steps(
+    workflow_session_factory,
+):
+    service = WorkflowService(session_factory=workflow_session_factory)
+    workflow_id = service.create_workflow("Hello")
+
+    assert service.get_workflow_steps(workflow_id) == []

@@ -11,18 +11,26 @@ class WorkflowRepository(BaseRepository[Workflow]):
     """Repository providing workflow-specific database operations."""
 
     DEFAULT_LIMIT = 50
+    MAX_LIMIT = 500
 
     def __init__(self, db: Session) -> None:
         super().__init__(Workflow, db)
 
-    def get_recent(self, limit: int = DEFAULT_LIMIT) -> list[Workflow]:
-        """Return the most recently started workflows."""
-        limit = max(1, min(limit, 500))
+    def get_recent(
+        self,
+        limit: int = DEFAULT_LIMIT,
+        offset: int = 0,
+    ) -> list[Workflow]:
+        """Return the most recently started workflows, newest first."""
+
+        limit = max(1, min(limit, self.MAX_LIMIT))
+        offset = max(0, offset)
 
         stmt = (
             select(Workflow)
             .order_by(Workflow.started_at.desc())
             .limit(limit)
+            .offset(offset)
         )
 
         return list(self.db.execute(stmt).scalars().all())
@@ -34,7 +42,7 @@ class WorkflowRepository(BaseRepository[Workflow]):
     ) -> list[Workflow]:
         """Return workflows filtered by status."""
 
-        limit = max(1, min(limit, 500))
+        limit = max(1, min(limit, self.MAX_LIMIT))
 
         stmt = (
             select(Workflow)

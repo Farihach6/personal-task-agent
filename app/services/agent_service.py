@@ -15,11 +15,12 @@ running Observe directly, exactly as the graph itself would have.
 
 from functools import lru_cache
 from typing import Any
-from app.core.exceptions import GuardrailViolation
+
 from app.agent.graph import build_graph
 from app.agent.nodes.observe_node import build_observe_node
 from app.agent.state import create_initial_state
 from app.agent.tools.tool_executor import ToolExecutor
+from app.core.exceptions import GuardrailViolation
 from app.core.logger import get_logger
 from app.llm.groq_client import GroqClient
 from app.services.workflow_service import WorkflowService
@@ -112,17 +113,18 @@ class AgentService:
         completes the workflow gracefully without executing it if rejected.
         """
         context = self._workflow_service.get_workflow_context(workflow_id)
-        if context.get("status") != "WAITING_APPROVAL":
-           raise GuardrailViolation(
-        f"Workflow {workflow_id} is not awaiting approval "
-        f"(current status: {context.get('status')!r}); it may have already been resolved."
-    )
         logger.info(
             "Resuming workflow_id=%s approved=%s tool=%s",
             workflow_id,
             approved,
             context.get("tool_name"),
         )
+
+        if context.get("status") != "WAITING_APPROVAL":
+            raise GuardrailViolation(
+                f"Workflow {workflow_id} is not awaiting approval "
+                f"(current status: {context.get('status')!r}); it may have already been resolved."
+            )
 
         state = create_initial_state(workflow_id, context["user_message"])
         state["intent"] = context["intent"]
@@ -133,6 +135,18 @@ class AgentService:
         approval_status = "APPROVED" if approved else "REJECTED"
 
         try:
+            self._workflow_service.save_step(
+                workflow_id=workflow_id,
+                node_name="approval",
+                action_summary=(
+                    f"Human approved running tool '{context.get('tool_name')}'."
+                    if approved
+                    else f"Human rejected running tool '{context.get('tool_name')}'."
+                ),
+                tool_name=context.get("tool_name"),
+                tool_input=context.get("tool_input"),
+            )
+
             if approved:
                 try:
                     tool_result = self._tool_executor.execute(
@@ -192,6 +206,8 @@ class AgentService:
         self, workflow_id: str, node_name: str, user_message: str, node_state: dict[str, Any]
     ) -> None:
         """Persist one workflow_steps row, shaped per node type."""
+        tool_name: str | None = None
+
         if node_name == "reason_node":
             node_type = "REASON"
             input_data = {"user_message": user_message}
@@ -202,6 +218,7 @@ class AgentService:
             output_data = {"plan": node_state["plan"]}
         elif node_name == "act_node":
             node_type = "ACT"
+            tool_name = node_state.get("tool_name")
             input_data = {"tool_name": node_state.get("tool_name"), "tool_input": node_state.get("tool_input")}
             output_data = {"tool_result": node_state.get("tool_result"), "status": node_state["status"]}
         elif node_name == "observe_node":
@@ -221,6 +238,7 @@ class AgentService:
             node_type=node_type,
             input_data=input_data,
             output_data=output_data,
+            tool_name=tool_name,
         )
 
 
