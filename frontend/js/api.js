@@ -14,7 +14,9 @@ const Api = (() => {
 
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
-      throw new Error(body.message || `Request failed with status ${response.status}`);
+      const error = new Error(body.message || `Request failed with status ${response.status}`);
+      error.status = response.status;
+      throw error;
     }
 
     return response.status === 204 ? null : response.json();
@@ -22,6 +24,7 @@ const Api = (() => {
 
   return {
     health: () => request("/health"),
+    chat: (message) => request("/chat", { method: "POST", body: JSON.stringify({ message }) }),
     createNote: (data) => request("/notes", { method: "POST", body: JSON.stringify(data) }),
     listNotes: (params = {}) => {
       const query = new URLSearchParams(
@@ -43,5 +46,11 @@ const Api = (() => {
     },
     getWorkflow: (workflowId) => request(`/workflows/${workflowId}`),
     getWorkflowSteps: (workflowId) => request(`/workflows/${workflowId}/steps`),
+    listLogs: (params = {}) => {
+      const query = new URLSearchParams(
+        Object.fromEntries(Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== ""))
+      ).toString();
+      return request(`/logs${query ? `?${query}` : ""}`);
+    },
   };
 })();

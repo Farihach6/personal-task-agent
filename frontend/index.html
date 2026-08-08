@@ -22,7 +22,41 @@
 
     <main class="app-main">
       <section id="tab-chat" class="tab-panel active">
-        <p class="placeholder">Chat interface will be implemented in a later milestone.</p>
+        <div class="chat-container">
+          <div class="chat-header">
+            <div>
+              <h2 class="chat-title">Chat with your agent</h2>
+              <p class="chat-subtitle">
+                Ask it to search the web, manage your notes, or send an email — sensitive
+                actions will pause for your approval before they run.
+              </p>
+            </div>
+            <button id="chat-clear-btn" type="button" class="btn btn-secondary">Clear Chat</button>
+          </div>
+
+          <div id="chat-messages" class="chat-messages" aria-live="polite" aria-relevant="additions">
+            <div id="chat-empty" class="chat-empty">
+              <p>No messages yet. Try: <em>"Save a note that I need to call the plumber"</em></p>
+            </div>
+          </div>
+
+          <div id="chat-status" class="chat-status" role="status" aria-live="polite"></div>
+
+          <form id="chat-form" class="chat-form" novalidate>
+            <label class="sr-only" for="chat-input">Message to the agent</label>
+            <textarea
+              id="chat-input"
+              class="input chat-textarea"
+              placeholder="Ask the agent to do something..."
+              rows="2"
+              maxlength="4000"
+            ></textarea>
+            <div class="chat-form-footer">
+              <span id="chat-char-count" class="chat-char-count">0 / 4000</span>
+              <button id="chat-send-btn" type="submit" class="btn btn-primary">Send</button>
+            </div>
+          </form>
+        </div>
       </section>
 
       <section id="tab-history" class="tab-panel">
@@ -78,7 +112,42 @@
       </section>
 
       <section id="tab-logs" class="tab-panel">
-        <p class="placeholder">Execution logs viewer will be implemented in a later milestone.</p>
+        <div class="history-toolbar">
+          <p class="approvals-hint">A live audit trail of every agent event — reasoning, tool calls, approvals, and failures.</p>
+          <button id="logs-refresh-btn" class="btn btn-secondary">Refresh</button>
+        </div>
+
+        <div class="logs-filters">
+          <input
+            type="text"
+            id="logs-workflow-id-input"
+            class="input"
+            placeholder="Filter by workflow ID..."
+          />
+          <label class="sr-only" for="logs-level-select">Log level</label>
+          <select id="logs-level-select" class="input logs-level-select">
+            <option value="">All levels</option>
+            <option value="INFO">Info</option>
+            <option value="WARNING">Warning</option>
+            <option value="ERROR">Error</option>
+          </select>
+        </div>
+
+        <div id="logs-state" class="notes-state"></div>
+
+        <div class="history-table-wrapper">
+          <table id="logs-table" class="history-table">
+            <thead>
+              <tr>
+                <th>Timestamp</th>
+                <th>Level</th>
+                <th>Workflow ID</th>
+                <th>Message</th>
+              </tr>
+            </thead>
+            <tbody id="logs-table-body"></tbody>
+          </table>
+        </div>
       </section>
     </main>
   </div>

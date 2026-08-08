@@ -5,6 +5,7 @@
   --color-text: #e6e8eb;
   --color-text-muted: #8b909a;
   --color-primary: #4f8cff;
+  --color-primary-dark: #3a6fd1;
   --font-sans: "Segoe UI", system-ui, -apple-system, sans-serif;
   --radius: 10px;
 }
@@ -60,4 +61,16 @@ body {
 .placeholder {
   color: var(--color-text-muted);
   font-size: 14px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
